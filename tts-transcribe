@@ -1,0 +1,289 @@
+#!/usr/bin/env python3
+"""
+Fast TR<->EN translator with explicit startup mode.
+
+Modes:
+--mode audio  : Turkish speech → English text
+--mode text   : English text → Turkish speech
+"""
+
+import os
+import sys
+import time
+import threading
+import subprocess
+import select
+import termios
+import tty
+import argparse
+import warnings
+from collections import deque
+
+import numpy as np
+import sounddevice as sd
+import webrtcvad
+import torch
+
+from faster_whisper import WhisperModel
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+
+warnings.filterwarnings(
+    "ignore",
+    message="pkg_resources is deprecated as an API"
+)
+
+# ======================
+# CLI Args
+# ======================
+parser = argparse.ArgumentParser()
+parser.add_argument(
+    "--mode",
+    choices=["audio", "text"],
+    required=True,
+    help="audio: Turkish speech → English | text: English → Turkish speech"
+)
+args = parser.parse_args()
+MODE = args.mode
+
+# ======================
+# Environment / warnings
+# ======================
+warnings.filterwarnings("ignore", message="pkg_resources is deprecated as an API")
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+torch.set_float32_matmul_precision("high")
+torch.backends.mps.allow_tf32 = True
+
+# ======================
+# CONFIG (OPTIMIZED)
+# ======================
+SAMPLE_RATE = 16000
+FRAME_MS = 30
+FRAME_SAMPLES = int(SAMPLE_RATE * FRAME_MS / 1000)
+
+PRE_ROLL_MS = 300
+END_SILENCE_MS = 600
+MIN_UTTERANCE_SECONDS = 0.5
+MAX_SPEECH_SECONDS = 32.0     # ↓ bounded for latency
+
+WHISPER_MODEL_SIZE = "large-v3"  # ⭐ best interactive tradeoff
+WHISPER_COMPUTE = "int8"
+
+TRANSLATION_MODEL = "facebook/nllb-200-distilled-600M"
+
+PIPER_DIR = os.path.expanduser("~/.local/share/piper")
+VOICE_TR = f"{PIPER_DIR}/tr_TR-fahrettin-medium.onnx"
+OUTPUT_WAV = "output.wav"
+
+# ======================
+# Terminal raw input
+# ======================
+stdin_fd = sys.stdin.fileno()
+old_settings = termios.tcgetattr(stdin_fd)
+tty.setcbreak(stdin_fd)
+
+
+def restore_terminal():
+    termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_settings)
+
+
+def read_key():
+    if select.select([sys.stdin], [], [], 0)[0]:
+        return sys.stdin.read(1)
+    return None
+
+
+# ======================
+# Load models
+# ======================
+print("🔥 Loading models...")
+
+if MODE == "audio":
+    stt = WhisperModel(
+        WHISPER_MODEL_SIZE,
+        device="cpu",
+        compute_type=WHISPER_COMPUTE
+    )
+
+tokenizer = AutoTokenizer.from_pretrained(TRANSLATION_MODEL)
+translator = AutoModelForSeq2SeqLM.from_pretrained(TRANSLATION_MODEL)
+translator.eval()
+
+if torch.backends.mps.is_available():
+    translator = translator.to("mps")
+
+# ======================
+# Audio + VAD
+# ======================
+vad = webrtcvad.Vad(2)
+pre_roll = deque(maxlen=int(PRE_ROLL_MS / FRAME_MS))
+speech_frames = deque(maxlen=int(MAX_SPEECH_SECONDS * 1000 / FRAME_MS))
+
+audio_lock = threading.Lock()
+in_speech = False
+silence_ms = 0
+
+
+def audio_callback(indata, frames, time_info, status):
+    global in_speech, silence_ms
+    pcm = indata[:, 0].tobytes()
+    pre_roll.append(pcm)
+
+    if vad.is_speech(pcm, SAMPLE_RATE):
+        with audio_lock:
+            if not in_speech:
+                speech_frames.extend(pre_roll)
+                in_speech = True
+                silence_ms = 0
+            speech_frames.append(pcm)
+    else:
+        if in_speech:
+            silence_ms += FRAME_MS
+            if silence_ms >= END_SILENCE_MS:
+                in_speech = False
+                silence_ms = 0
+
+
+# ======================
+# ASR worker (single-threaded)
+# ======================
+audio_event = threading.Event()
+
+
+def asr_worker():
+    while True:
+        audio_event.wait()
+        audio_event.clear()
+
+        with audio_lock:
+            if not speech_frames:
+                continue
+            raw = b"".join(speech_frames)
+            speech_frames.clear()
+
+        audio = np.frombuffer(raw, dtype=np.int16)
+        if len(audio) / SAMPLE_RATE < MIN_UTTERANCE_SECONDS:
+            continue
+
+        audio_f = np.asarray(audio, dtype=np.float32)
+        audio_f *= (1.0 / 32768.0)
+
+        segments, _ = stt.transcribe(
+            audio_f,
+            language="tr",
+            beam_size=1,
+            best_of=1,
+            temperature=0.0,
+            vad_filter=False
+        )
+
+        tr_text = " ".join(s.text for s in segments).strip()
+        if not tr_text:
+            continue
+
+        print(f"\n🗣️ TR: {tr_text}")
+
+        tokenizer.src_lang = "tur_Latn"
+        inputs = tokenizer(tr_text, return_tensors="pt")
+        if torch.backends.mps.is_available():
+            inputs = {k: v.to("mps") for k, v in inputs.items()}
+
+        forced_id = tokenizer.convert_tokens_to_ids("eng_Latn")
+        out = translator.generate(
+            **inputs,
+            forced_bos_token_id=forced_id,
+            max_length=256,
+            num_beams=4,               # ⭐ sweet spot
+            early_stopping=False,
+            no_repeat_ngram_size=3
+        )
+
+        print("🌍 EN:", tokenizer.decode(out[0], skip_special_tokens=True))
+        print("\n🎙️ Listening...\n")
+
+
+# Start ASR worker if needed
+if MODE == "audio":
+    threading.Thread(target=asr_worker, daemon=True).start()
+
+# ======================
+# Text mode processing
+# ======================
+
+def process_text(text):
+    print(f"\n⌨️ EN: {text}")
+
+    tokenizer.src_lang = "eng_Latn"
+    inputs = tokenizer(text, return_tensors="pt")
+    if torch.backends.mps.is_available():
+        inputs = {k: v.to("mps") for k, v in inputs.items()}
+
+    forced_id = tokenizer.convert_tokens_to_ids("tur_Latn")
+    out = translator.generate(
+        **inputs,
+        forced_bos_token_id=forced_id,
+        max_length=256,
+        num_beams=4,
+        early_stopping=False,
+        no_repeat_ngram_size=3
+    )
+
+    tr_text = tokenizer.decode(out[0], skip_special_tokens=True)
+    print("🌍 TR:", tr_text)
+
+    subprocess.run(
+        ["piper", "-m", VOICE_TR, "-f", OUTPUT_WAV],
+        input=tr_text,
+        text=True
+    )
+    subprocess.run(["afplay", OUTPUT_WAV])
+
+
+# ======================
+# Main
+# ======================
+print(f"\n🚀 Mode: {MODE.upper()}")
+
+try:
+    if MODE == "audio":
+        print("🎙️ Speak Turkish → press any key (ESC exits)\n")
+        with sd.InputStream(
+            samplerate=SAMPLE_RATE,
+            channels=1,
+            dtype="int16",
+            blocksize=FRAME_SAMPLES,
+            callback=audio_callback
+        ):
+            while True:
+                k = read_key()
+                if k == "\x1b":
+                    break
+                if k:
+                    audio_event.set()
+                time.sleep(0.01)
+
+    else:
+        print("⌨️ Type English → ENTER speaks Turkish (ESC exits)\n")
+        buffer = ""
+        while True:
+            k = read_key()
+            if not k:
+                time.sleep(0.01)
+                continue
+
+            if k == "\x1b":
+                break
+            elif k in ("\n", "\r"):
+                print()
+                process_text(buffer)
+                buffer = ""
+            elif k == "\x7f":
+                buffer = buffer[:-1]
+                print("\r⌨️ " + buffer + "  \x08\x08", end="", flush=True)
+            elif k.isprintable():
+                buffer += k
+                print("\r⌨️ " + buffer, end="", flush=True)
+
+finally:
+    restore_terminal()
+    print("\nExited.")
