@@ -52,7 +52,7 @@ class Evidence:
 class EndpointBoundaryTests(unittest.TestCase):
     def setUp(self):
         self.core = load_core()
-        self.core.show_inflight_partial_transcript = lambda *args: None
+        self.core.show_inflight_partial_transcript = lambda *args, **kwargs: None
         self.core.clear_inflight_partial_marker = lambda *args: None
         self.scheduler = Scheduler()
         self.endpoint = self.core.RingEndpointDetector(self.core.NativeTimestampRingBuffer(1), self.scheduler)
@@ -96,6 +96,36 @@ class EndpointBoundaryTests(unittest.TestCase):
         np.testing.assert_array_equal(pcm[:4 * 320], np.full(4 * 320, 4500))
         self.assertEqual(evidence.events[0]["type"], "endpoint_speech_gate")
 
+    def test_rejected_sparse_speech_retires_blank_card_after_request_timer_is_cleared(self):
+        # Exercise real UI lifecycle helpers; the ordinary endpoint fixtures
+        # replace those helpers because most tests only inspect captured PCM.
+        core = self.core = load_core()
+        self.scheduler = Scheduler()
+        self.endpoint = core.RingEndpointDetector(core.NativeTimestampRingBuffer(1), self.scheduler)
+        core.ring_endpoint = self.endpoint
+        evidence = core.audio_evidence = Evidence()
+        self.endpoint._current_endpoint_threshold = lambda: 5000
+        clock = [100.0]
+        with patch.object(core, "render_dashboard"), patch.object(core.time, "perf_counter", side_effect=lambda: clock[0]):
+            # Enough source-clock duration for a preview, but fewer voiced
+            # frames than the endpoint speech gate accepts for a final.
+            self.feed(1, True)
+            self.feed(55, False)
+            self.feed(3, True)
+            utterance_id = self.endpoint.utterance_id
+            self.assertTrue(any(request[2] for request in self.scheduler.requests))
+            self.assertTrue(core.placeholder_only_entry(core.ui_state["left_active"][utterance_id]))
+            core.clear_inflight_partial_marker(utterance_id)
+            self.assertNotIn(utterance_id, core.inflight_partial_markers)
+            self.endpoint.finalize()
+            self.assertEqual(self.scheduler.finals, [])
+            self.assertEqual(evidence.events[0]["type"], "endpoint_speech_gate")
+            self.assertFalse(self.endpoint.in_speech)
+            clock[0] += core.args.inflight_partial_timeout_ms / 1000.0 + 1
+            core.prune_empty_source_placeholders()
+            self.assertNotIn(utterance_id, core.ui_state["left_active"])
+            self.assertNotIn(utterance_id, core.ui_state["left_order"])
+
     def test_speech_gate_keeps_interior_pauses_in_its_denominator(self):
         evidence = self.core.audio_evidence = Evidence()
         self.core.args.min_speech_ratio = 0.9
@@ -118,7 +148,9 @@ class EndpointBoundaryTests(unittest.TestCase):
             endpoint = self.core.RingEndpointDetector(self.core.NativeTimestampRingBuffer(1), scheduler)
             clock = [0.0]
             self.frame_number = 0
-            with patch.object(self.core.time, "perf_counter", side_effect=lambda: clock[0]):
+            with patch.object(self.core.time, "perf_counter", side_effect=lambda: clock[0]), \
+                    patch.object(self.core.time, "time_ns", return_value=1_000_000_000_000_000_000), \
+                    patch.object(self.core.time, "monotonic_ns", return_value=0):
                 for index in range(125):
                     clock[0] = index * 0.02 if paced else 0
                     self.feed(1, index < 25 or index >= 100, endpoint=endpoint)

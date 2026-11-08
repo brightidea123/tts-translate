@@ -44,11 +44,14 @@
         <div id="error-banner" class="error-banner" role="alert" hidden><span id="error-text"></span><button id="dismiss-error" type="button" aria-label="Dismiss message">×</button></div>
       </section>
 
-      <section class="health-strip" aria-label="Live processing status">
+      <details class="processing-status">
+        <summary><span class="processing-status-label">Processing status</span><span id="processing-status-summary" class="processing-status-summary">Audio idle · Transcription idle · Translation idle</span></summary>
+        <section class="health-strip" aria-label="Live processing status">
         <div class="health-item" id="health-capture" data-state="idle"><span class="health-icon" aria-hidden="true">◉</span><span class="health-copy"><strong>Audio input</strong><span class="health-detail">Not listening</span></span><span class="health-state">Idle</span></div>
         <div class="health-item" id="health-asr" data-state="idle"><span class="health-icon text-icon" aria-hidden="true">Aa</span><span class="health-copy"><strong>Transcription</strong><span class="health-detail">Waiting for a session</span></span><span class="health-state">Idle</span></div>
         <div class="health-item" id="health-translation" data-state="idle"><span class="health-icon text-icon" aria-hidden="true">↔</span><span class="health-copy"><strong>Translation</strong><span class="health-detail">Waiting for a session</span></span><span class="health-state">Idle</span></div>
-      </section>
+        </section>
+      </details>
 
       <div class="workspace">
         <section class="panel incoming-panel" aria-labelledby="incoming-heading">
@@ -68,7 +71,7 @@
           </div>
           <form id="reply-form" class="composer">
             <label id="composer-label" for="reply-text">Write in English</label>
-            <div class="composer-box"><textarea id="reply-text" dir="auto" rows="3" maxlength="10000" placeholder="Type your reply…" aria-describedby="composer-help" spellcheck="true"></textarea><button id="send-reply" class="send-button" type="submit" aria-label="Translate and speak reply" disabled><span aria-hidden="true">↑</span></button></div>
+            <div class="composer-box"><textarea id="reply-text" dir="auto" rows="2" maxlength="10000" placeholder="Type your reply…" aria-describedby="composer-help" spellcheck="true"></textarea><button id="send-reply" class="send-button" type="submit" aria-label="Translate and speak reply" disabled><span aria-hidden="true">↑</span></button></div>
             <div class="composer-bottom"><span id="composer-help">Enter to send · Shift + Enter for a new line</span><span id="reply-destination">Spoken in Turkish</span></div>
           </form>
         </section>

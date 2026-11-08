@@ -52,6 +52,28 @@ or full committed mailbox rejects new input visibly; a rejected typed reply
 stays editable. Pasted Unicode text and Enter are drained without waiting for
 another keystroke. Full-duplex playback does not reset or mute capture.
 
+Live source previews default to `--partial-display-policy latest`: the first
+decoded words appear immediately, including the provisional tail. Both the
+terminal and web UI show provisional words in red with a solid underline. The
+steadier prefix remains in normal text while only the tail changes. Overlapping
+windows align across punctuation and casing changes, and temporarily shorter
+previews retain earlier words. Words remain visible during the next decode;
+final source ASR can correct the complete phrase. Before any words are available, the placeholder is
+only `..`. Empty cards expire independently of request completion after capture
+and pending final ASR finish (the default grace period is 2.2 seconds from card
+creation); stopping a session removes unused empty cards immediately. Actual
+source or translated words are preserved. This styling reflects agreement between previews, not a measured
+accuracy probability. The live profile requests previews at roughly one-second
+audio intervals; display still waits for that decode to finish. Use
+`--partial-display-policy stable` for a conservative view (also the default for
+the `accurate` profile). Partial translation keeps its separate stable-prefix
+policy.
+
+Each web **PHRASE** heading shows its local capture start time and clip duration
+in seconds (for example, `14:32:08 · 3.4 s`). Duration grows during the live
+phrase and is retained with the finalized text. It measures the captured clip,
+including pauses and onset/ending silence, rather than model processing time.
+
 Missing Metal, missing model files, failed synthesis and missing matching voices
 produce visible errors. Worker details are local in each
 `runtime-reports/sessions/<session ID>/` directory: `pipeline-events.jsonl`,
@@ -143,6 +165,8 @@ The installed packages and model selections are new restoration work, not recove
 Use `python scripts/run_profile.py baseline --source HE --target FR --dump-config` to inspect the effective setup, or `--dry-run` to print a command. Extra core flags go after `--`, for example `-- --no-session-logs`. Run `python scripts/generate_fixtures.py --generate` and the explicit model smoke tools described in the validation guide from a normal Terminal with Metal/audio access.
 
 Use `--dump-config` with the same flags to inspect this configuration without starting the live session. Use `--list-devices --audio-io sounddevice --vad-backend energy` to inspect available devices after installing SoundDevice; `--input-device` selects an input by name or index. Allow microphone access for the terminal application when macOS requests it. If PortAudio cannot be loaded, check the SoundDevice installation; a system PortAudio installation can be supplied with `brew install portaudio`.
+
+Prefer the exact **input name** for LitLink: numeric device indices can change when audio devices reconnect. The web UI refreshes the device list in a fresh process and starts capture by name. An old numeric selection or missing device requires choosing an input again; it never silently switches to a microphone. Capture checks input channels and 16 kHz mono support before starting model workers, and reports available inputs if that check fails. Restart the web server after updating, refresh its page, then refresh Audio input and select the intended LitLink track by name. `Invalid number of channels` for an output-only index is a device-selection error; rebuilding the native helper does not fix a SoundDevice selection.
 
 The script captures **one selected input per process**. LitLink must route the desired application's audio into that device; selecting its name does not configure tracks or the call application. Simultaneous sources and hardware-clock synchronization are not implemented. Sequenced PCM enters a bounded capture buffer; accepted committed ASR work stays ordered while obsolete partials may be discarded. Capture overruns are reported as gaps rather than silently joining disjoint audio. A full committed mailbox rejects new work visibly rather than blocking capture or typing.
 

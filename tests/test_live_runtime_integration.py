@@ -68,6 +68,18 @@ class LiveRuntimeIntegrationTests(unittest.TestCase):
     def setUp(self):
         self.core = load_core()
 
+    def test_unusable_capture_input_fails_before_session_or_models_start(self):
+        core = self.core
+        with patch.object(core, "checked_input_device", side_effect=RuntimeError("Not an input device")), \
+                patch.object(core, "initialize_session_runtime") as session, \
+                patch.object(core, "ProcessStage") as model, \
+                patch.object(core, "setup_terminal") as terminal:
+            with self.assertRaisesRegex(RuntimeError, "Not an input device"):
+                core.main()
+            session.assert_not_called()
+            model.assert_not_called()
+            terminal.assert_not_called()
+
     def test_main_captures_and_accepts_typing_while_both_models_stay_loading(self):
         core = self.core
         order, stages, capture = [], {}, {}
@@ -108,7 +120,9 @@ class LiveRuntimeIntegrationTests(unittest.TestCase):
         forbidden = lambda *a, **kw: (_ for _ in ()).throw(AssertionError("model operation ran on main/UI startup"))
         no_worker = lambda: None
         with patch.dict(core.__dict__, {
-            "ProcessStage": make_stage, "sd": SimpleNamespace(InputStream=InputStream),
+            "ProcessStage": make_stage, "sd": SimpleNamespace(
+                InputStream=InputStream, query_devices=lambda *_a, **_k: {"index": 1, "name": "LitLink", "max_input_channels": 2},
+                check_input_settings=lambda **_kw: order.append("input checked")),
             "setup_terminal": lambda: order.append("terminal"), "restore_terminal": no_worker,
             "init_dashboard": lambda _lines: order.append("dashboard"), "render_dashboard": no_worker,
             "read_key": lambda _timeout: next(keys), "coordinator_worker": no_worker,
@@ -121,6 +135,8 @@ class LiveRuntimeIntegrationTests(unittest.TestCase):
         self.assertEqual(capture["feeder"].captured_samples, core.FRAME_SAMPLES)
         self.assertTrue(np.array_equal(capture["processed"], np.full(core.FRAME_SAMPLES, 2000, dtype=np.int16)))
         self.assertEqual(capture["kwargs"]["samplerate"], 16000)
+        self.assertEqual(capture["kwargs"]["device"], 1)
+        self.assertLess(order.index("input checked"), order.index("asr created"))
         self.assertLess(order.index("dashboard"), order.index("capture entered"))
         self.assertEqual(stages["asr"].starts, 1)
         self.assertEqual(stages["translation"].starts, 1)

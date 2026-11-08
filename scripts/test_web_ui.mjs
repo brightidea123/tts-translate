@@ -1,6 +1,165 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { AutoScrollController, BoundedCache, SelectionTranslator, selectedMessage, messageIsFinal } from '../web/ui-interactions.js';
+import { AutoScrollController, BoundedCache, SelectionTranslator, selectedMessage, messageIsFinal, inputSelectionAvailable, selectInputDevice, refreshInputOptions, sourcePreviewSegments, renderSourcePreview, formatPhraseTiming, renderPhraseTiming } from '../web/ui-interactions.js';
+
+test('phrase timing uses captured start time and updates live/final clip seconds', () => {
+  const start = '2026-11-08T05:10:23.698Z';
+  const live = formatPhraseTiming({ audio_started_at: start, audio_duration_seconds: 1.24 }, { timeZone: 'UTC' });
+  assert.equal(live.text, '05:10:23 · 1.2 s');
+  assert.match(live.title, /8 Nov 2026/);
+  assert.match(live.title, /Speech clip duration: 1.2 seconds/);
+  const final = formatPhraseTiming({ audio_started_at: start, audio_duration_seconds: 12.36, source_final: true }, { timeZone: 'UTC' });
+  assert.equal(final.text, '05:10:23 · 12.4 s');
+  assert.equal(formatPhraseTiming({ audio_started_at: start, audio_duration_seconds: 0 }, { timeZone: 'Europe/Istanbul' }).text, '08:10:23 · 0.0 s');
+});
+
+test('phrase timing omits missing or invalid metadata without inventing clip times', () => {
+  for (const item of [{}, null, { audio_started_at: 'invalid', audio_duration_seconds: -1 }, { audio_started_at: '', audio_duration_seconds: NaN }]) {
+    assert.deepEqual(formatPhraseTiming(item), { text: '', title: '' });
+  }
+  assert.equal(formatPhraseTiming({ audio_duration_seconds: 4.56 }).text, '4.6 s');
+  assert.equal(formatPhraseTiming({ audio_started_at: '2026-11-08T05:10:23Z', audio_duration_seconds: '7' }, { timeZone: 'UTC' }).text, '05:10:23');
+});
+
+test('unchanged clip timing leaves its label untouched while source updates and live duration still advances', () => {
+  let writes = 0, label = '';
+  const element = { set textContent(value) { writes += 1; label = value; },
+    setAttribute() { writes += 1; } };
+  const item = { audio_started_at: '2026-11-08T05:10:23Z', audio_duration_seconds: 2.1, source: 'first reading' };
+  renderPhraseTiming(element, item, { timeZone: 'UTC' });
+  assert.equal(label, '05:10:23 · 2.1 s');
+  const initialWrites = writes;
+  renderPhraseTiming(element, { ...item, source: 'refined reading', source_inflight: true }, { timeZone: 'UTC' });
+  assert.equal(writes, initialWrites);
+  renderPhraseTiming(element, { ...item, audio_duration_seconds: 3.2 }, { timeZone: 'UTC' });
+  assert.equal(label, '05:10:23 · 3.2 s');
+  assert.equal(element.hidden, false);
+  renderPhraseTiming(element, { ...item, audio_duration_seconds: 3.2 }, { timeZone: 'Europe/Istanbul' });
+  assert.equal(label, '08:10:23 · 3.2 s');
+  renderPhraseTiming(element, {}, { timeZone: 'UTC' });
+  assert.equal(label, '');
+  assert.equal(element.hidden, true);
+});
+
+function previewEnvironment() {
+  const classes = new Set();
+  let writes = 0;
+  const content = { children: [], dataset: { sourceLanguage: 'HE', targetLanguage: 'AR' }, nodeType: 1,
+    classList: { toggle(name, enabled) { enabled ? classes.add(name) : classes.delete(name); }, contains(name) { return classes.has(name); } },
+    replaceChildren(...nodes) { writes += 1; this.children = nodes; for (const node of nodes) node.parentElement = this; },
+    append(node) { this.children.push(node); node.parentElement = this; },
+    removeChild(node) { this.children = this.children.filter(child => child !== node); node.parentElement = null; },
+    closest(selector) { return selector === '.message-text' ? this : 'card'; },
+  };
+  const documentObject = {
+    createTextNode(text) { return { nodeType: 3, textContent: text }; },
+    createElement() { return { nodeType: 1, textContent: '', closest(selector) { return this.parentElement.closest(selector); } }; },
+  };
+  return { content, documentObject, writes: () => writes,
+    text: () => content.children.map(node => node.textContent).join('') };
+}
+
+test('source preview shows short placeholder and first words without stability gating', () => {
+  const env = previewEnvironment();
+  renderSourcePreview(env.content, { source_inflight: true }, '', env.documentObject);
+  assert.equal(env.text(), '..');
+  assert.equal(env.content.classList.contains('placeholder'), true);
+  renderSourcePreview(env.content, {}, 'שלום', env.documentObject);
+  assert.equal(env.text(), 'שלום');
+  assert.equal(env.content.children[0].className, 'transcript-provisional');
+  assert.equal(env.content.classList.contains('placeholder'), false);
+  const writes = env.writes();
+  renderSourcePreview(env.content, { source_inflight: true }, 'שלום', env.documentObject);
+  renderSourcePreview(env.content, { source_inflight: false }, 'שלום', env.documentObject);
+  assert.equal(env.writes(), writes);
+  assert.equal(env.text(), 'שלום');
+});
+
+test('source preview revises uncertain words, preserves mixed RTL spacing and clears styling at final', () => {
+  const env = previewEnvironment();
+  const text = 'שלום  world <script> & مرحبا';
+  renderSourcePreview(env.content, { source_stable: 'שלום' }, text, env.documentObject);
+  assert.equal(env.text(), text);
+  assert.equal(env.content.children[0].textContent, 'שלום');
+  assert.equal(env.content.children[1].textContent, '  world <script> & مرحبا');
+  assert.equal(env.content.children[1].className, 'transcript-provisional');
+  const selection = { isCollapsed: false, rangeCount: 1, anchorNode: env.content.children[0], focusNode: env.content.children[1],
+    toString: () => text, getRangeAt: () => ({}) };
+  assert.equal(selectedMessage(selection).text, text);
+  renderSourcePreview(env.content, { source_stable: 'שלום' }, 'שלום חברים', env.documentObject);
+  assert.equal(env.text(), 'שלום חברים');
+  renderSourcePreview(env.content, { source_final: true, source_stable: 'שלום' }, 'שלום חברים', env.documentObject);
+  assert.equal(env.content.children.length, 1);
+  assert.equal(env.content.children[0].nodeType, 3);
+  assert.equal(env.text(), 'שלום חברים');
+});
+
+test('stale stable-prefix metadata never hides a corrected provisional reading', () => {
+  assert.deepEqual(sourcePreviewSegments({ source_stable: 'old prefix' }, 'new reading'),
+    { text: 'new reading', stable: '', provisional: 'new reading', placeholder: false });
+  assert.equal(sourcePreviewSegments({}, '..').placeholder, true);
+});
+
+test('steady source node survives provisional-tail edits and authoritative corrections replace safely', () => {
+  const env = previewEnvironment();
+  renderSourcePreview(env.content, { source_stable: 'שלום' }, 'שלום עולם', env.documentObject);
+  const steady = env.content.children[0];
+  const provisional = env.content.children[1];
+  const writes = env.writes();
+  renderSourcePreview(env.content, { source_stable: 'שלום' }, 'שלום חברים חדשים', env.documentObject);
+  assert.equal(env.content.children[0], steady);
+  assert.equal(env.content.children[1], provisional);
+  assert.equal(steady.textContent, 'שלום');
+  assert.equal(env.text(), 'שלום חברים חדשים');
+  assert.equal(env.writes(), writes);
+  renderSourcePreview(env.content, { source_stable: 'שלום' }, 'שלום', env.documentObject);
+  assert.equal(env.content.children[0], steady);
+  assert.equal(env.content.children.length, 1);
+  renderSourcePreview(env.content, { source_stable: 'שלום' }, 'שלום שוב', env.documentObject);
+  assert.equal(env.content.children[0], steady);
+  assert.equal(env.text(), 'שלום שוב');
+  renderSourcePreview(env.content, { source_final: true }, 'ערב טוב', env.documentObject);
+  assert.equal(env.text(), 'ערב טוב');
+  assert.equal(env.content.children.length, 1);
+  assert.equal(env.content.children[0].nodeType, 3);
+  assert.notEqual(env.content.children[0], steady);
+});
+
+class DeviceOption {
+  constructor(text, value) { this.text = text; this.value = value; this.disabled = false; }
+}
+function deviceSelect(value) {
+  return { value, options: [], add(option) { this.options.push(option); },
+    replaceChildren(...options) { this.options = options; this.value = options[0]?.value; } };
+}
+
+test('audio input names survive renumbering and old numeric selections require reselection', () => {
+  const select = deviceSelect('LitLink');
+  refreshInputOptions(select, [{ name: 'LitLink', index: 7, max_input_channels: 2 }], DeviceOption);
+  assert.equal(select.value, 'LitLink');
+  assert.equal(inputSelectionAvailable(select), true);
+  refreshInputOptions(select, [{ name: 'LitLink', index: 0, max_input_channels: 2 }], DeviceOption);
+  assert.equal(select.value, 'LitLink');
+  assert.equal(inputSelectionAvailable(select), true);
+  select.value = '0';
+  refreshInputOptions(select, [{ name: 'Different source', index: 0, max_input_channels: 1 }], DeviceOption);
+  assert.equal(select.value, '0');
+  assert.equal(inputSelectionAvailable(select), false);
+});
+
+test('missing or ambiguous input never silently selects a microphone', () => {
+  const select = deviceSelect('LitLink');
+  refreshInputOptions(select, [{ name: 'Mic', max_input_channels: 1 }, { name: 'Speakers', max_input_channels: 0 }], DeviceOption);
+  assert.equal(select.value, 'LitLink');
+  assert.equal(inputSelectionAvailable(select), false);
+  assert.equal(select.options.some(option => option.value === 'Speakers'), false);
+  selectInputDevice(select, 'Mic', DeviceOption);
+  assert.equal(inputSelectionAvailable(select), true);
+  refreshInputOptions(select, [{ name: 'Mic', max_input_channels: 1, ambiguous: true }], DeviceOption);
+  assert.equal(inputSelectionAvailable(select), false);
+  selectInputDevice(select, '', DeviceOption);
+  assert.equal(inputSelectionAvailable(select), true);
+});
 
 class Element {
   constructor() { this.listeners = {}; this.attributes = {}; this.dataset = {}; this.style = {}; this.isConnected = true; this.nodeType = 1; this.checked = true; this.hidden = true; this.scrollTop = 300; this.scrollHeight = 700; }

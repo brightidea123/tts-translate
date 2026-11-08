@@ -1,4 +1,4 @@
-import { AutoScrollController, SelectionTranslator, messageIsFinal } from './ui-interactions.js';
+import { AutoScrollController, SelectionTranslator, messageIsFinal, inputSelectionAvailable, selectInputDevice, refreshInputOptions, renderSourcePreview, renderPhraseTiming } from './ui-interactions.js';
 
 (() => {
   'use strict';
@@ -21,6 +21,7 @@ import { AutoScrollController, SelectionTranslator, messageIsFinal } from './ui-
     'composer-label', 'composer-help', 'reply-destination', 'runtime-status', 'detail-session',
     'detail-recording', 'detail-directory', 'flush-audio', 'input-hint', 'toast',
     'transcript-autoscroll', 'replies-autoscroll', 'selection-tooltip',
+    'processing-status-summary',
   ].map(id => [id, $(id)]));
 
   let state = null;
@@ -161,6 +162,7 @@ import { AutoScrollController, SelectionTranslator, messageIsFinal } from './ui-
     node.querySelector('.health-state').textContent = labels[key] || key.charAt(0).toUpperCase() + key.slice(1);
     node.querySelector('.health-detail').textContent = info.detail || fallback;
     node.querySelector('.health-detail').title = info.detail || fallback;
+    return { label: labels[key] || key.charAt(0).toUpperCase() + key.slice(1), state: key };
   }
 
   function renderControls() {
@@ -172,7 +174,7 @@ import { AutoScrollController, SelectionTranslator, messageIsFinal } from './ui-
     elements['refresh-devices'].disabled = pending.has('devices');
     elements['start-session'].hidden = running;
     elements['stop-session'].hidden = !running;
-    elements['start-session'].disabled = !connected || changing;
+    elements['start-session'].disabled = !connected || changing || pending.has('devices') || !inputSelectionAvailable(elements['input-device']);
     elements['stop-session'].disabled = !connected || changing;
     elements['start-session'].lastChild.textContent = pending.has('start') ? ' Starting…' : 'Start listening';
     elements['stop-session'].lastChild.textContent = pending.has('stop') ? ' Stopping…' : 'Stop session';
@@ -208,9 +210,16 @@ import { AutoScrollController, SelectionTranslator, messageIsFinal } from './ui-
     topline.className = 'message-topline';
     const number = document.createElement('span');
     number.className = 'message-number';
+    const heading = document.createElement('div');
+    heading.className = 'message-heading';
+    const timing = document.createElement('span');
+    timing.className = 'message-timing';
+    timing.dir = 'ltr';
+    timing.hidden = true;
+    heading.append(number, timing);
     const phase = document.createElement('span');
     phase.className = 'message-phase';
-    topline.append(number, phase);
+    topline.append(heading, phase);
     card.append(topline);
     const parts = {};
     for (const kind of ['source', 'translation']) {
@@ -225,7 +234,7 @@ import { AutoScrollController, SelectionTranslator, messageIsFinal } from './ui-
       card.append(part);
       parts[kind] = { part, label, content };
     }
-    return { card, number, phase, parts };
+    return { card, number, timing, phase, parts };
   }
 
   function renderMessages(kind, messages, source, target) {
@@ -252,6 +261,7 @@ import { AutoScrollController, SelectionTranslator, messageIsFinal } from './ui-
       } else if (list.children[index] !== node.card) list.insertBefore(node.card, list.children[index] || null);
       if (node.card === protectedCard) continue;
       node.number.textContent = `${kind === 'transcript' ? 'PHRASE' : 'REPLY'} ${String(index + 1).padStart(2, '0')}`;
+      if (kind === 'transcript') renderPhraseTiming(node.timing, item);
       const sourceFinal = item.source_final ?? item.src_final ?? false;
       const translationFinal = item.translation_final ?? item.dst_final ?? false;
       node.card.dataset.final = String(messageIsFinal(item));
@@ -265,14 +275,18 @@ import { AutoScrollController, SelectionTranslator, messageIsFinal } from './ui-
       ]) {
         const part = node.parts[partKind];
         const clean = cleanDisplay(text);
-        const placeholder = !clean;
         part.part.dir = directionOf(language);
         part.content.lang = language.toLowerCase();
         part.content.dir = 'auto';
         part.content.dataset.sourceLanguage = language;
         part.content.dataset.targetLanguage = partKind === 'source' ? targetCode : sourceCode;
         part.label.textContent = `${nameOf(language).toUpperCase()}${partKind === 'translation' ? ' · TRANSLATION' : ' · ORIGINAL'}`;
-        const display = clean || (partKind === 'source' ? 'Listening…' : stageInfo(state?.stages?.translation).state === 'failed' ? 'Translation unavailable' : 'Translation will appear here…');
+        if (kind === 'transcript' && partKind === 'source') {
+          renderSourcePreview(part.content, item, clean);
+          continue;
+        }
+        const placeholder = !clean;
+        const display = clean || (partKind === 'source' ? '..' : stageInfo(state?.stages?.translation).state === 'failed' ? 'Translation unavailable' : 'Translation will appear here…');
         if (part.content.textContent !== display) part.content.textContent = display;
         part.content.classList.toggle('placeholder', placeholder);
       }
@@ -310,11 +324,7 @@ import { AutoScrollController, SelectionTranslator, messageIsFinal } from './ui-
       elements['source-language'].value = codeOf(config.source_language || 'TR');
       elements['target-language'].value = codeOf(config.target_language || 'EN');
       const deviceValue = config.input_device == null ? '' : String(config.input_device);
-      if (![...elements['input-device'].options].some(option => option.value === deviceValue)) {
-        const option = new Option(deviceValue, deviceValue);
-        elements['input-device'].add(option);
-      }
-      elements['input-device'].value = deviceValue;
+      selectInputDevice(elements['input-device'], deviceValue);
       elements['debug-recording'].checked = Boolean(config.debug);
       settingsDirty = false;
       lastConfig = configKey;
@@ -323,9 +333,13 @@ import { AutoScrollController, SelectionTranslator, messageIsFinal } from './ui-
     document.body.classList.toggle('running', Boolean(state.running));
     elements['session-state'].textContent = state.running ? 'Session in progress' : 'Ready when you are';
     elements['session-state'].dataset.running = String(Boolean(state.running));
-    renderHealth('capture', state.running ? 'Waiting for incoming audio' : 'Not listening');
-    renderHealth('asr', state.running ? 'Preparing transcription' : 'Waiting for a session');
-    renderHealth('translation', state.running ? 'Preparing translation' : 'Waiting for a session');
+    const health = [
+      ['Audio', renderHealth('capture', state.running ? 'Waiting for incoming audio' : 'Not listening')],
+      ['Transcription', renderHealth('asr', state.running ? 'Preparing transcription' : 'Waiting for a session')],
+      ['Translation', renderHealth('translation', state.running ? 'Preparing translation' : 'Waiting for a session')],
+    ];
+    elements['processing-status-summary'].textContent = health.map(([label, info]) => `${label} ${info.label}`).join(' · ');
+    elements['processing-status-summary'].dataset.issue = String(health.some(([, info]) => ['failed', 'no input'].includes(info.state)));
     renderMessages('transcript', state.transcript, source, target);
     renderMessages('replies', state.replies, target, source);
     elements['runtime-status'].textContent = cleanDisplay(state.status) || (state.running ? 'Listening and processing independently. You can reply at any time.' : 'Choose your languages and audio input to begin.');
@@ -352,19 +366,9 @@ import { AutoScrollController, SelectionTranslator, messageIsFinal } from './ui-
     renderControls();
     try {
       const payload = await api('/api/devices');
-      const selected = elements['input-device'].value;
-      elements['input-device'].replaceChildren(new Option('System default input', ''));
-      for (const device of payload.devices || []) {
-        const value = device.id ?? device.index ?? device.name;
-        if (value == null || device.max_input_channels === 0) continue;
-        const option = new Option(device.name || `Input ${value}`, String(value));
-        elements['input-device'].add(option);
-      }
-      if (selected && ![...elements['input-device'].options].some(option => option.value === selected)) {
-        elements['input-device'].add(new Option(selected, selected));
-      }
-      elements['input-device'].value = selected;
+      refreshInputOptions(elements['input-device'], payload.devices || []);
       if (payload.error) showError(payload.error);
+      else if (!inputSelectionAvailable(elements['input-device'])) showError('The saved audio input is unavailable. Choose the intended LitLink input by name.');
     } catch (error) {
       showError(`Audio inputs could not be listed: ${error.message}`);
     } finally {
@@ -401,11 +405,12 @@ import { AutoScrollController, SelectionTranslator, messageIsFinal } from './ui-
 
   elements['session-form'].addEventListener('submit', async event => {
     event.preventDefault();
+    if (elements['start-session'].disabled) return;
     const source = elements['source-language'].value;
     const target = elements['target-language'].value;
     if (source === target) { showError('Choose different incoming and translation languages.'); return; }
     const rawDevice = elements['input-device'].value;
-    const inputDevice = rawDevice === '' ? null : /^\d+$/.test(rawDevice) ? Number(rawDevice) : rawDevice;
+    const inputDevice = rawDevice === '' ? null : rawDevice;
     const result = await command('start', { source_language: source, target_language: target, input_device: inputDevice, debug: elements['debug-recording'].checked });
     if (result) {
       settingsDirty = false;
@@ -434,7 +439,7 @@ import { AutoScrollController, SelectionTranslator, messageIsFinal } from './ui-
     settingsDirty = true;
   });
   for (const id of ['source-language', 'target-language', 'input-device', 'debug-recording']) {
-    elements[id].addEventListener('change', () => { settingsDirty = true; });
+    elements[id].addEventListener('change', () => { settingsDirty = true; renderControls(); });
   }
 
   async function sendReply(event) {

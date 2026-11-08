@@ -217,6 +217,19 @@ def _panel_messages(ui_state: Mapping[str, Any], side: str, source_language: str
             "source_language": source_language,
             "target_language": target_language,
         }
+        if side == "left":
+            for key in ("audio_started_at", "audio_duration_seconds"):
+                if key in entry:
+                    message[key] = entry[key]
+        preview = entry.get("source_preview")
+        if isinstance(preview, Mapping) and not message["source_final"]:
+            text = _plain(preview.get("text", ""))
+            stable = _plain(preview.get("stable", ""))
+            if not text.startswith(stable):
+                stable = ""
+            message.update(source=text, source_stable=stable,
+                           source_provisional=text[len(stable):],
+                           source_inflight=bool(preview.get("inflight")))
         # A refined active entry replaces a same-ID historical entry without
         # inventing a second conversation turn or mutating the application's UI.
         output[:] = [old for old in output if old["id"] != identity]

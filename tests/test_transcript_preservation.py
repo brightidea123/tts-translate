@@ -183,5 +183,203 @@ class TranscriptPreservationTests(unittest.TestCase):
         self.assertEqual(errors, [])
 
 
+    def run_preview_results(self, results_to_deliver):
+        core = self.core
+        stop = threading.Event()
+        snapshots, errors = [], []
+        state = deepcopy(core.ui_state)
+        state.update(left_active={}, left_order=[], left_done=[])
+
+        class FiniteQueue(Queue):
+            def task_done(self):
+                super().task_done()
+                snapshots.append(deepcopy(state))
+                if self.unfinished_tasks == 0:
+                    stop.set()
+
+        results = FiniteQueue()
+        for result in results_to_deliver:
+            results.put_nowait(result)
+        with patch.dict(core.__dict__, {
+            "asr_results": results, "shutdown_event": stop, "ui_state": state,
+            "render_dashboard": lambda: None, "ui_update": lambda **kw: errors.append(kw),
+            "ring_endpoint": None, "latency_traces": {}, "inflight_partial_markers": {},
+            "current_partial_utterance_id": None, "audio_final_transcripts": {},
+            "record_asr_decision": lambda *a: None, "enqueue_translation_task": lambda _task: True,
+            "forced_bos_for_target": lambda _target: None,
+        }), patch.object(core.args, "stream_audio_translation", False):
+            core.coordinator_worker()
+        self.assertEqual(errors, [])
+        return snapshots
+
+    def test_first_word_is_visible_by_default_and_can_be_revised_then_finalized(self):
+        core = self.core
+        self.assertEqual(core.args.partial_display_policy, "latest")
+        first = self.result(1, "שלום", duration=1)
+        first.partial = True
+        corrected = self.result(1, "שלומך", duration=2)
+        corrected.partial = True
+        final = self.result(1, "שלום לך!", duration=3)
+        late = self.result(1, "late preview", duration=2)
+        late.partial = True
+        snapshots = self.run_preview_results([first, corrected, final, late])
+        initial = snapshots[0]["left_active"][1]
+        self.assertEqual(initial["source_preview"], {"text": "שלום", "stable": "", "inflight": False})
+        self.assertFalse(initial["src_final"])
+        self.assertIn(core.ANSI_PROVISIONAL, initial["src"])
+        self.assertEqual(snapshots[1]["left_active"][1]["source_preview"]["text"], "שלומך")
+        final_entry = snapshots[2]["left_active"][1]
+        self.assertTrue(final_entry["src_final"])
+        self.assertNotIn("source_preview", final_entry)
+        self.assertEqual(snapshots[3]["left_active"][1], final_entry)
+
+    def test_empty_later_preview_keeps_the_last_visible_words(self):
+        first = self.result(1, "שלום", duration=1)
+        first.partial = True
+        empty = self.result(1, "", duration=2)
+        empty.partial = True
+        snapshots = self.run_preview_results([first, empty])
+        self.assertEqual(snapshots[0]["left_active"][1]["src"], snapshots[1]["left_active"][1]["src"])
+        self.assertEqual(snapshots[1]["left_active"][1]["source_preview"]["text"], "שלום")
+
+    def test_rolling_preview_retains_stable_prefix_and_revises_only_new_tail_until_final(self):
+        first = self.result(1, "please keep these words while we buy five blue chairs", duration=5)
+        second = self.result(1, "please keep these words while we buy five blue chairs today", duration=6)
+        shifted = self.result(1, "THESE words while we buy six red chairs today and tomorrow", start=1, duration=6)
+        shortened = self.result(1, "these words while we", start=1, duration=7)
+        for result in [first, second, shifted, shortened]:
+            result.partial = True
+        final = self.result(1, "actually replace the entire phrase with the authoritative final", duration=9)
+        snapshots = self.run_preview_results([first, second, shifted, shortened, final])
+        steady = snapshots[1]["left_active"][1]["source_preview"]["stable"]
+        self.assertEqual(steady, "please keep these words while we")
+        live = snapshots[2]["left_active"][1]["source_preview"]
+        self.assertEqual(live["stable"], steady)
+        self.assertEqual(live["text"], "please keep these words while we buy six red chairs today and tomorrow")
+        self.assertEqual(snapshots[3]["left_active"][1]["source_preview"], live)
+        final_entry = snapshots[4]["left_active"][1]
+        self.assertNotIn("source_preview", final_entry)
+        self.assertIn("authoritative final", self.core.strip_ansi(final_entry["src"]))
+        self.assertNotIn("please keep", self.core.strip_ansi(final_entry["src"]))
+
+    def test_busy_marker_is_two_dots_and_never_blinks_over_visible_words(self):
+        core = self.core
+        core.reset_current_partial_state(next_utterance_id=1)
+        with patch.object(core, "render_dashboard"):
+            core.show_inflight_partial_transcript(1)
+            entry = core.ui_state["left_active"][1]
+            self.assertEqual(core.strip_ansi(entry["src"]), "🗣️ HE~: ..")
+            core.ui_set_panel_entry("left", 1, "src", core.format_partial_transcript_for_ui("שלום", ""), False,
+                                    revision=2, preview=core.source_preview("שלום", "", inflight=False))
+            visible = entry["src"]
+            core.show_inflight_partial_transcript(1)
+            self.assertEqual(entry["src"], visible)
+            self.assertEqual(entry["src_revision"], 2)
+            self.assertTrue(entry["source_preview"]["inflight"])
+            core.clear_inflight_partial_marker(1)
+            self.assertFalse(entry["source_preview"]["inflight"])
+            self.assertEqual(entry["src"], visible)
+            core.show_inflight_partial_transcript(1)
+            core.inflight_partial_markers[1] = core.time.perf_counter() - 30
+            core.sweep_inflight_partial_markers()
+            self.assertEqual(core.ui_state["left_active"][1]["src"], visible)
+
+    def test_pending_hint_cannot_copy_another_utterance_or_resurrect_final_text(self):
+        core = self.core
+        core.reset_current_partial_state(next_utterance_id=2)
+        core.current_partial_display_text = "another utterance"
+        core.current_partial_display_locked_prefix = "another"
+        with patch.object(core, "render_dashboard"):
+            core.show_inflight_partial_transcript(3)
+            self.assertEqual(core.ui_state["left_active"][3]["source_preview"]["text"], "")
+            core.show_inflight_partial_transcript(1)
+            self.assertNotIn(1, core.ui_state["left_active"])
+            core.ui_set_panel_entry("left", 3, "src", "HE: finalized", True, revision=4)
+            before = deepcopy(core.ui_state["left_active"][3])
+            core.show_inflight_partial_transcript(3)
+            self.assertEqual(core.ui_state["left_active"][3], before)
+            core.ui_set_panel_entry("left", 3, "dst", "AR: final translation", True, revision=4)
+            self.assertNotIn(3, core.ui_state["left_active"])
+            core.show_inflight_partial_transcript(3)
+            self.assertNotIn(3, core.ui_state["left_active"])
+
+    def test_placeholder_waits_for_active_capture_then_expires_without_guessing_from_text(self):
+        core = self.core
+        core.reset_current_partial_state(next_utterance_id=1)
+        with patch.object(core, "render_dashboard"), patch.object(core, "capture_utterance_active", return_value=True):
+            core.show_inflight_partial_transcript(1)
+            core.inflight_partial_markers[1] = core.time.perf_counter() - 30
+            core.sweep_inflight_partial_markers()
+            self.assertIn(1, core.ui_state["left_active"])
+        with patch.object(core, "render_dashboard"), patch.object(core, "capture_utterance_active", return_value=False):
+            core.sweep_inflight_partial_markers()
+            self.assertNotIn(1, core.ui_state["left_active"])
+        self.assertFalse(core.placeholder_only_entry({"src": "HE~: ..", "src_final": False}))
+
+    def test_empty_result_does_not_orphan_card_when_request_timer_is_cleared(self):
+        core = self.core
+        core.reset_current_partial_state(next_utterance_id=1)
+        with patch.object(core, "render_dashboard"), patch.object(core, "capture_utterance_active", return_value=True):
+            core.show_inflight_partial_transcript(1)
+            core.clear_inflight_partial_marker(1)
+            core.ui_state["left_active"][1]["source_placeholder_since"] -= 30
+            self.assertNotIn(1, core.inflight_partial_markers)
+            core.sweep_inflight_partial_markers()
+            self.assertIn(1, core.ui_state["left_active"])
+        with patch.object(core, "render_dashboard") as render, \
+                patch.object(core, "capture_utterance_active", return_value=False):
+            core.sweep_inflight_partial_markers()
+            self.assertNotIn(1, core.ui_state["left_active"])
+            self.assertNotIn(1, core.ui_state["left_order"])
+            render.assert_called_once()
+
+    def test_final_pending_protects_empty_card_until_result_or_failure(self):
+        core = self.core
+        core.reset_current_partial_state(next_utterance_id=1)
+        with patch.object(core, "render_dashboard"), patch.object(core, "capture_utterance_active", return_value=False):
+            core.show_inflight_partial_transcript(1)
+            core.clear_inflight_partial_marker(1)
+            core.ui_state["left_active"][1]["source_placeholder_since"] -= 30
+            core.mark_final_asr_pending(1)
+            core.sweep_inflight_partial_markers()
+            self.assertIn(1, core.ui_state["left_active"])
+            core.clear_final_asr_pending(1)
+            core.sweep_inflight_partial_markers()
+            self.assertNotIn(1, core.ui_state["left_active"])
+
+    def test_empty_card_cleanup_preserves_actual_source_translation_and_final_text(self):
+        core = self.core
+        with patch.object(core, "render_dashboard"), patch.object(core, "capture_utterance_active", return_value=False):
+            for uid in [1, 2, 3, 4]:
+                core.show_inflight_partial_transcript(uid)
+                core.clear_inflight_partial_marker(uid)
+                core.ui_state["left_active"][uid]["source_placeholder_since"] -= 30
+            core.ui_set_panel_entry("left", 2, "src", core.format_partial_transcript_for_ui("שלום", ""), False,
+                                    preview=core.source_preview("שלום", "", inflight=False))
+            core.ui_set_panel_entry("left", 3, "dst", "AR~: ترجمة", False)
+            core.ui_set_panel_entry("left", 4, "src", "HE: מקור סופי", True)
+            self.assertNotIn("source_placeholder_since", core.ui_state["left_active"][2])
+            core.sweep_inflight_partial_markers()
+            self.assertNotIn(1, core.ui_state["left_active"])
+            self.assertEqual(set(core.ui_state["left_active"]), {2, 3, 4})
+            core.prune_empty_source_placeholders(force=True)
+            self.assertEqual(set(core.ui_state["left_active"]), {2, 3, 4})
+
+    def test_placeholder_housekeeping_is_independent_of_optional_watchdog_and_stop_clears_fresh_blanks(self):
+        core = self.core
+        with patch.object(core, "render_dashboard"), patch.object(core, "capture_utterance_active", return_value=False), \
+                patch.object(core.args, "stuck_partial_watchdog", False):
+            core.show_inflight_partial_transcript(1)
+            core.clear_inflight_partial_marker(1)
+            core.ui_state["left_active"][1]["source_placeholder_since"] -= 30
+            core.sweep_inflight_partial_markers()
+            self.assertNotIn(1, core.ui_state["left_active"])
+            core.show_inflight_partial_transcript(2)
+            core.prune_empty_source_placeholders()
+            self.assertIn(2, core.ui_state["left_active"])
+            core.prune_empty_source_placeholders(force=True)
+            self.assertNotIn(2, core.ui_state["left_active"])
+
+
 if __name__ == "__main__":
     unittest.main()

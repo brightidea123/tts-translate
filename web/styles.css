@@ -31,3 +31,54 @@ main{padding-top:25px;padding-bottom:22px}.session-card{border:1px solid var(--l
 .selection-tooltip[data-status=pending] .selection-tooltip-text{color:#c7dade;font-size:12px}
 .selection-tooltip[data-status=error] .selection-tooltip-text{color:#ffd5c4;font-size:12px}
 @media(max-width:440px){.panel-header-controls{flex-direction:row;align-items:center;justify-content:space-between;width:100%}}
+.message-text .transcript-provisional{color:#b3261e;text-decoration-line:underline;text-decoration-style:solid;text-decoration-color:currentColor;text-underline-offset:.2em;text-decoration-thickness:1px}
+.message-card[data-final=false] .message-text .transcript-provisional{color:#ffb4ab}
+.message-heading{display:flex;align-items:center;flex-wrap:wrap;gap:4px 9px;min-width:0;direction:ltr}.message-timing{font-size:9px;color:#748995;font-variant-numeric:tabular-nums;white-space:nowrap;unicode-bidi:isolate}.message-card[data-final=false] .message-timing{color:#b1cbd5}.message-phase{flex:none}
+
+/* Keep the reading panes dense while retaining extra space for RTL glyphs. */
+main{padding-top:16px}
+.session-card{padding:16px 20px 0}
+.section-topline{margin-bottom:12px}
+.eyebrow{font-size:8.5px;letter-spacing:1.2px;margin-bottom:4px}
+h1{font-size:18px;line-height:1.3;letter-spacing:-.4px}
+.session-options{margin-top:14px;min-height:42px}
+.error-banner{margin:0 -20px;padding:10px 20px}
+.processing-status{margin:10px 0 14px;border:1px solid #e0e8ed;border-radius:8px;background:#f8fafb}
+.processing-status>summary{display:flex;align-items:center;gap:9px;min-height:34px;padding:8px 12px;list-style:none;cursor:pointer;outline-offset:3px}
+.processing-status>summary::-webkit-details-marker{display:none}
+.processing-status>summary:before{content:"›";font-size:17px;line-height:1;color:#607b8a;transform-origin:center}
+.processing-status[open]>summary:before{transform:rotate(90deg)}
+.processing-status[open]>summary{border-bottom:1px solid #e0e8ed}
+.processing-status-label{font-size:11px;font-weight:600;color:#506d7a}
+.processing-status-summary{margin-left:auto;font-size:10px;line-height:1.5;color:#617b8a;text-align:right}
+.processing-status-summary[data-issue=true]{color:#a24d3b}
+.processing-status .health-strip{margin:0;border:0;border-radius:0 0 8px 8px}
+.processing-status .health-item{padding:10px 12px}
+.panel-header{padding:16px 18px 14px}
+h2{font-size:16px;margin-top:5px}
+.message-scroll{padding:0 16px}
+.message-list{padding:12px 0;gap:10px}
+.message-topline{padding:8px 11px 0}
+.message-part{padding:9px 11px 10px}
+.part-label{margin-bottom:5px}
+.message-text{font-size:13px;line-height:1.6}
+.message-text:lang(ar),.message-text:lang(he){font-size:14.5px;line-height:1.7}
+.composer{padding:12px 16px 10px}
+.composer>label{margin-bottom:7px}
+.composer textarea{min-height:66px;padding:10px 48px 9px 11px}
+.panel-footer{min-height:40px;padding:0 16px}
+@media(min-width:801px){
+  .app-shell{height:100vh;height:100dvh;display:flex;flex-direction:column}
+  .app-header,.session-card,.processing-status,.workspace-footer{flex-shrink:0}
+  main{display:flex;flex-direction:column;flex:1;min-height:0}
+  .workspace{flex:1;min-height:360px}
+  .panel{height:100%;min-height:0}
+}
+@media(max-width:800px){
+  .session-card{padding:14px 16px 0}
+  .error-banner{margin:0 -16px;padding:10px 16px}
+  h1{font-size:17px}
+  .processing-status>summary{flex-wrap:wrap;gap:4px 8px}
+  .processing-status-summary{flex-basis:100%;margin-left:18px;text-align:left}
+}
+@media(max-width:440px){h1{font-size:16px}}

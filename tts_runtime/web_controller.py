@@ -22,6 +22,7 @@ from typing import Any
 from uuid import uuid4
 
 from .selection_requests import SelectionRequests
+from .audio_devices import fresh_input_devices
 
 
 LANGUAGES = frozenset({"AR", "HE", "DE", "TR", "FR", "RU", "EN", "ES"})
@@ -439,19 +440,19 @@ class WebController:
 
     def devices(self) -> list[dict]:
         try:
-            import sounddevice as sd
-            default = sd.default.device[0]
-            devices = [{"id": index, "name": str(info["name"]),
-                        "max_input_channels": int(info["max_input_channels"]),
-                        "default_samplerate": float(info["default_samplerate"]), "default": index == default}
-                       for index, info in enumerate(sd.query_devices()) if info["max_input_channels"] > 0]
+            devices = fresh_input_devices(self.python_executable)
             with self._lock:
-                self._device_error = ""
+                self._device_error = "" if devices else "No audio inputs found. Check LitLink's input route, then refresh Audio input."
             return devices
         except Exception as exc:
             with self._lock:
                 self._device_error = f"Unable to enumerate input devices: {exc}"
             return []
+
+    @property
+    def device_error(self) -> str:
+        with self._lock:
+            return self._device_error
 
     def close(self) -> None:
         self.stop()

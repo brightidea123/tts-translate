@@ -1,5 +1,33 @@
 /* Browser-only interactions stay independent of the audio/model controller. */
 
+export function inputSelectionAvailable(select) {
+  return [...select.options].some(option => option.value === select.value && !option.disabled);
+}
+
+export function selectInputDevice(select, value, OptionClass = Option) {
+  if (![...select.options].some(option => option.value === value)) {
+    const option = new OptionClass(`Unavailable input: ${value} — choose an input`, value);
+    option.disabled = true;
+    select.add(option);
+  }
+  select.value = value;
+}
+
+export function refreshInputOptions(select, devices, OptionClass = Option) {
+  const selected = select.value;
+  select.replaceChildren(new OptionClass('System default input', ''));
+  for (const device of devices) {
+    if (!device.name || device.max_input_channels < 1) continue;
+    // Names survive PortAudio renumbering. Never turn an old index into a
+    // different source, or silently replace a missing LitLink input with a mic.
+    const label = device.ambiguous ? `${device.name} — ambiguous input name` : device.name;
+    const option = new OptionClass(label, device.name);
+    option.disabled = Boolean(device.ambiguous);
+    select.add(option);
+  }
+  selectInputDevice(select, selected, OptionClass);
+}
+
 export class BoundedCache {
   constructor(limit = 64) { this.limit = limit; this.values = new Map(); }
   get(key) {
@@ -24,6 +52,110 @@ export function selectionLanguages(block) {
 
 export function messageIsFinal(item) {
   return Boolean((item.source_final ?? item.src_final ?? false) && (item.translation_final ?? item.dst_final ?? false));
+}
+
+const phraseTimeFormatters = new BoundedCache(8);
+
+function phraseTimeFormats(timeZone) {
+  const key = timeZone ?? null;
+  let formats = phraseTimeFormatters.get(key);
+  if (!formats) {
+    formats = {
+      clock: new Intl.DateTimeFormat('en-GB', { hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23', timeZone }),
+      full: new Intl.DateTimeFormat('en-GB', { dateStyle: 'medium', timeStyle: 'long', timeZone }),
+    };
+    phraseTimeFormatters.set(key, formats);
+  }
+  return formats;
+}
+
+export function formatPhraseTiming(item, { timeZone } = {}) {
+  const timestamp = typeof item?.audio_started_at === 'string' ? Date.parse(item.audio_started_at) : NaN;
+  const duration = item?.audio_duration_seconds;
+  const parts = [], details = [];
+  if (Number.isFinite(timestamp)) {
+    const date = new Date(timestamp);
+    const formats = phraseTimeFormats(timeZone);
+    parts.push(formats.clock.format(date));
+    details.push(`Speech clip starts at ${formats.full.format(date)}`);
+  }
+  if (typeof duration === 'number' && Number.isFinite(duration) && duration >= 0) {
+    parts.push(`${duration.toFixed(1)} s`);
+    details.push(`Speech clip duration: ${duration.toFixed(1)} seconds`);
+  }
+  return { text: parts.join(' · '), title: details.join(' · ') };
+}
+
+const phraseTimingRenders = new WeakMap();
+
+export function renderPhraseTiming(element, item, { timeZone } = {}) {
+  const startedAt = item?.audio_started_at, duration = item?.audio_duration_seconds;
+  const previous = phraseTimingRenders.get(element);
+  // Model/source updates do not change a finalized clip's timing. Leave its
+  // label untouched and avoid date parsing/formatting on every state snapshot.
+  if (previous && previous.startedAt === startedAt && Object.is(previous.duration, duration) && previous.timeZone === timeZone) return previous.value;
+  const value = formatPhraseTiming(item, { timeZone });
+  element.textContent = value.text;
+  element.title = value.title;
+  element.setAttribute('aria-label', value.title);
+  element.hidden = !value.text;
+  phraseTimingRenders.set(element, { startedAt, duration, timeZone, value });
+  return value;
+}
+
+export function sourcePreviewSegments(item, source) {
+  const final = Boolean(item.source_final ?? item.src_final ?? false);
+  const text = String(source ?? '');
+  const placeholder = !text || (!final && text === '..');
+  if (placeholder) return { text: '..', stable: '', provisional: '', placeholder: true };
+  if (final) return { text, stable: text, provisional: '', placeholder: false };
+  const candidate = typeof item.source_stable === 'string' ? item.source_stable : '';
+  const stable = text.startsWith(candidate) ? candidate : '';
+  return { text, stable, provisional: text.slice(stable.length), placeholder: false };
+}
+
+const sourcePreviewRenders = new WeakMap();
+
+export function renderSourcePreview(content, item, source, documentObject = document) {
+  const preview = sourcePreviewSegments(item, source);
+  // Busy status changes must not replace already-visible words or disturb
+  // selection. Only a changed reading or changed stability needs new nodes.
+  const key = JSON.stringify([preview.text, preview.stable, preview.placeholder]);
+  const previous = sourcePreviewRenders.get(content);
+  if (previous?.key === key) return preview;
+  if (previous && !previous.placeholder && !preview.placeholder && previous.stable === preview.stable) {
+    // Keep the steady prefix node in place as only the uncertain ending is
+    // revised. Readers and selections in that prefix retain their DOM anchor.
+    if (preview.provisional) {
+      if (!previous.tail) {
+        previous.tail = documentObject.createElement('span');
+        previous.tail.className = 'transcript-provisional';
+        content.append(previous.tail);
+      }
+      previous.tail.textContent = preview.provisional;
+    } else if (previous.tail) {
+      content.removeChild(previous.tail);
+      previous.tail = null;
+    }
+    previous.key = key;
+    return preview;
+  }
+  const nodes = [];
+  let tail = null;
+  if (preview.placeholder) nodes.push(documentObject.createTextNode('..'));
+  else {
+    if (preview.stable) nodes.push(documentObject.createTextNode(preview.stable));
+    if (preview.provisional) {
+      tail = documentObject.createElement('span');
+      tail.className = 'transcript-provisional';
+      tail.textContent = preview.provisional;
+      nodes.push(tail);
+    }
+  }
+  content.replaceChildren(...nodes);
+  content.classList.toggle('placeholder', preview.placeholder);
+  sourcePreviewRenders.set(content, { key, stable: preview.stable, placeholder: preview.placeholder, tail });
+  return preview;
 }
 
 export class AutoScrollController {

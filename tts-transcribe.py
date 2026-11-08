@@ -54,6 +54,9 @@ from tts_runtime.worker import ProcessStage, StageEvent
 from tts_runtime.text_output import clean_model_output, configure_translation_stop_tokens
 from tts_runtime.asr_quality import pcm_quality, summarize_whisper_result, issue_reasons, final_preview_disagrees
 from tts_runtime.audio_evidence import AudioEvidence, create_session_directory
+from tts_runtime.audio_devices import checked_input_device
+from tts_runtime.live_preview import merge_preview, word_key
+from tts_runtime.clip_timing import capture_clip_timing
 from tts_runtime.model_assets import resolve_mlx_whisper_reference, require_cached_mlx_whisper, LARGE_V3_REPOSITORY
 from tts_runtime.selection_inference import SelectionTask, SelectionResult
 from optional_dependencies import optional_dependency
@@ -113,6 +116,7 @@ mlx_lm_stream_generate = None
 mlx_lm_import_error: Exception | None = None
 mlx_translation_stop_ids: frozenset[int] = frozenset()
 runtime_session_id = ""
+audio_wall_clock_offset_ns = time.time_ns() - time.monotonic_ns()
 runtime_session_dir: Path | None = None
 runtime_audio_dir: Path | None = None
 audio_review_mode = "off"
@@ -388,7 +392,7 @@ parser.add_argument("--stable-translation-min-words", type=int, default=3, help=
 parser.add_argument("--partial-translation-stabilize-seconds", type=float, default=2.0, help="wait this many seconds without Turkish partial text changes before queueing partial MT")
 parser.add_argument("--partial-translation-min-completeness-score", type=int, default=2, help="minimum semantic completeness score before translating a stabilized partial clump")
 parser.add_argument("--partial-translation-force-words", type=int, default=10, help="translate a stabilized partial clump once it reaches this many words even without punctuation")
-parser.add_argument("--partial-display-policy", choices=["stable", "clump", "latest"], default="stable", help="source panel partial policy: stable=show locked ASR only, clump=show only translation-ready clumps, latest=show speculative tail")
+parser.add_argument("--partial-display-policy", choices=["stable", "clump", "latest"], default="latest", help="source panel partial policy: latest=show provisional words immediately, stable=show locked ASR only, clump=show only translation-ready clumps")
 parser.add_argument("--partial-display-min-words", type=int, default=2, help="minimum locked words before a stable partial is shown")
 parser.add_argument("--partial-queue-latest-only", action="store_true", default=True, help="keep only the newest partial ASR job per utterance; final ASR still preempts all partials")
 parser.add_argument("--no-partial-queue-latest-only", dest="partial_queue_latest_only", action="store_false")
@@ -719,6 +723,7 @@ ANSI_RESET = "\033[0m"
 ANSI_DIM_GREEN = "\033[2;32m"
 ANSI_BRIGHT_WHITE = "\033[97m"
 ANSI_DIM_WHITE = "\033[2;37m"
+ANSI_PROVISIONAL = "\033[4;91m"
 
 
 def effective_config() -> dict:
@@ -870,6 +875,8 @@ def resolved_audio_review_mode() -> str:
 def initialize_session_runtime() -> None:
     """Isolate every launch's generated audio, logs and diagnostic artifacts."""
     global runtime_session_id, runtime_session_dir, runtime_audio_dir, audio_evidence, audio_review_mode
+    global audio_wall_clock_offset_ns
+    audio_wall_clock_offset_ns = time.time_ns() - time.monotonic_ns()
     root = Path(__file__).resolve().parent
     audio_review_mode = resolved_audio_review_mode()
     if audio_review_mode != "off":
@@ -1640,7 +1647,7 @@ class StableWordLock:
         common_count = 0
         for i in range(min_len):
             token = self.history[0][i]
-            if all(h[i] == token for h in self.history):
+            if all(word_key(h[i]) == word_key(token) for h in self.history):
                 common_count += 1
             else:
                 break
@@ -1896,15 +1903,8 @@ def merge_partial_transcript(previous: str, current: str) -> str:
 
 def merge_partial_transcript_with_provenance(previous: str, current: str,
                                             previous_span: tuple | None, current_span: tuple | None) -> str:
-    """Replace revisions of a growing window; merge only shifted windows.
-
-    An ASR hypothesis for the same source start is a new reading of the whole
-    window, including corrected words. Appending it to the older hypothesis
-    would turn a correction such as 'five' → 'six' into two spoken requests.
-    """
-    if previous_span is not None and current_span is not None and previous_span[:3] == current_span[:3]:
-        return normalize_text(current if current_span[3] >= previous_span[3] else previous)
-    return merge_partial_transcript(previous, current)
+    """Revise growing windows and retain preceding text across shifted ones."""
+    return merge_preview(previous, current, previous_span, current_span).text
 
 
 def word_count(text: str) -> int:
@@ -2466,13 +2466,7 @@ def partial_translation_clump(text: str) -> str:
 
 
 def partial_display_source_text(partial_text: str, locked_prefix: str) -> str:
-    """
-    Return the Turkish span that is stable enough to put on screen.
-
-    Raw Whisper partials are useful for endpointing, but they can be revised
-    aggressively. The display path is intentionally stricter so visible text
-    and display-only English MT stay close to the eventual final transcript.
-    """
+    """Select visible source words; provisional display never commits a final."""
     text = normalize_text(partial_text)
     locked = normalize_text(locked_prefix)
     min_words = max(1, int(args.partial_display_min_words))
@@ -2602,6 +2596,10 @@ def color_uncertain(text: str) -> str:
     return f"{ANSI_DIM_WHITE}{text}{ANSI_RESET}"
 
 
+def color_provisional(text: str) -> str:
+    return f"{ANSI_PROVISIONAL}{terminal_safe_text(text)}{ANSI_RESET}"
+
+
 def color_right_en(text: str) -> str:
     # Right panel = typed/source side: reverse colors, English dim green.
     return color_tr(text)
@@ -2617,17 +2615,23 @@ def color_right_tr(text: str) -> str:
 def format_partial_transcript_for_ui(partial_text: str, locked_prefix: str, *, inflight: bool = False) -> str:
     text = normalize_text(partial_text)
     locked = normalize_text(locked_prefix)
-    inflight_note = color_uncertain("… transcribing current audio (quality pending)") if inflight else ""
     if not text:
-        body = inflight_note or color_uncertain("… listening")
-        return f"🗣️ {source_label()}~: {body}"
-    if not args.confidence_ui or not locked or not text.startswith(locked):
-        body = color_uncertain(text) if inflight else color_left_tr(text)
-        return f"🗣️ {source_label()}~: {body}" + (f"  ·  {inflight_note}" if inflight_note and text else "")
-    tail = normalize_text(text[len(locked):])
-    tail_text = f"  ·  {color_uncertain('… ' + tail)}" if tail else ""
-    inflight_text = f"  ·  {inflight_note}" if inflight_note else ""
-    return f"🗣️ {source_label()}✓: {color_left_tr(locked)}{tail_text}{inflight_text}"
+        return f"🗣️ {source_label()}~: {color_uncertain('..')}"
+    if not args.confidence_ui:
+        body = color_left_tr(text)
+    elif locked and text.startswith(locked):
+        body = color_left_tr(locked) + color_provisional(text[len(locked):])
+    else:
+        body = color_provisional(text)
+    # Keep real words on screen while the next request is running. A toggling
+    # busy suffix used to redraw this line on every request and hide its tail.
+    return f"🗣️ {source_label()}~: {body}"
+
+
+def source_preview(partial_text: str, locked_prefix: str, *, inflight: bool) -> dict:
+    text = normalize_text(partial_text)
+    stable = normalize_text(locked_prefix)
+    return {"text": text, "stable": stable if text.startswith(stable) else "", "inflight": inflight}
 
 def strip_ansi(text: str) -> str:
     return ANSI_RE.sub("", text)
@@ -3068,7 +3072,8 @@ def ui_commit_if_ready(side: str, entry_id: int) -> None:
     if not entry:
         return
     if entry.get("src_final") and entry.get("dst_final"):
-        ui_state[done_key].append({"entry_id": entry_id, "src": entry.get("src", ""), "dst": entry.get("dst", "")})
+        ui_state[done_key].append({"entry_id": entry_id, "src": entry.get("src", ""), "dst": entry.get("dst", ""),
+                                  **{key: entry[key] for key in ("audio_started_at", "audio_duration_seconds") if key in entry}})
         ui_state[active_key].pop(entry_id, None)
         ui_state[order_key] = [x for x in ui_state[order_key] if x != entry_id]
 
@@ -3101,6 +3106,9 @@ def ui_set_panel_entry(
     text: str,
     final: bool,
     revision: int | None = None,
+    *,
+    preview: dict | None = None,
+    audio_timing: dict | None = None,
 ) -> bool:
     active_key = f"{side}_active"
     order_key = f"{side}_order"
@@ -3123,6 +3131,17 @@ def ui_set_panel_entry(
         ui_state[order_key].append(entry_id)
 
     if field == "src":
+        if side == "left" and audio_timing:
+            update_entry_audio_timing(entry, audio_timing, final=final)
+        entry.pop("source_preview", None)
+        if not final and preview is not None:
+            entry["source_preview"] = dict(preview)
+        if not final and preview is not None and not preview["text"]:
+            # Request timers end when an ASR result arrives, even when it is
+            # empty. Keep a separate lifetime for the card itself.
+            entry.setdefault("source_placeholder_since", time.perf_counter())
+        else:
+            entry.pop("source_placeholder_since", None)
         source_text_changed = entry.get("src") != text
         if source_text_changed and revision is None:
             entry["dst"] = ""
@@ -3180,40 +3199,119 @@ def render_input(buffer: str, active: bool = True) -> None:
     ui_update(input=buffer if active else "")
 
 
-def show_inflight_partial_transcript(utterance_id: int, revision: int | None = None) -> None:
+def update_entry_audio_timing(entry: dict, timing: dict, *, final: bool = False) -> None:
+    if "audio_started_at" in timing:
+        if final or "audio_started_at" not in entry:
+            entry["audio_started_at"] = timing["audio_started_at"]
+    if "audio_duration_seconds" in timing:
+        duration = timing["audio_duration_seconds"]
+        entry["audio_duration_seconds"] = duration if final else max(duration, entry.get("audio_duration_seconds", 0))
+
+
+def show_inflight_partial_transcript(utterance_id: int, revision: int | None = None,
+                                    *, audio_timing: dict | None = None) -> None:
     """
     Surface that audio is being decoded without making it look final.
 
     These entries are UI-only hints. They are automatically removed if the ASR
     lane produces no text/result, preventing permanent "in-flight" ghosts.
     """
-    current_revision = revision if revision is not None else (current_partial_revision or None)
-    inflight_partial_markers[utterance_id] = time.perf_counter()
+    with current_partial_state_lock:
+        if current_partial_utterance_id is not None and current_partial_utterance_id > utterance_id:
+            return
+        owns_state = current_partial_utterance_id == utterance_id
+        text = current_partial_display_text if owns_state else ""
+        stable = current_partial_display_locked_prefix if owns_state else ""
+        current_revision = revision
+        if current_revision is None and owns_state:
+            current_revision = current_partial_revision or None
     with ui_lock:
+        entry = ui_state["left_active"].get(utterance_id)
+        if (entry and entry.get("src_final")) or any(item.get("entry_id") == utterance_id for item in ui_state["left_done"]):
+            return
+        inflight_partial_markers[utterance_id] = time.perf_counter()
+        if entry:
+            before_timing = (entry.get("audio_started_at"), entry.get("audio_duration_seconds"))
+            if audio_timing:
+                update_entry_audio_timing(entry, audio_timing)
+            existing = entry.get("source_preview")
+            if existing is not None:
+                # The coordinator may have published a newer preview after
+                # the snapshot above. Never replace it with older global text.
+                entry["source_preview"] = {**existing, "inflight": True}
+            # Existing words and their revision stay intact during decoding.
+            if before_timing != (entry.get("audio_started_at"), entry.get("audio_duration_seconds")):
+                render_dashboard()
+            return
         ui_set_panel_entry(
             "left",
             utterance_id,
             "src",
-            format_partial_transcript_for_ui(current_partial_display_text, current_partial_display_locked_prefix, inflight=True),
+            format_partial_transcript_for_ui(text, stable, inflight=True),
             final=False,
             revision=current_revision,
+            preview=source_preview(text, stable, inflight=True),
+            audio_timing=audio_timing,
         )
         render_dashboard()
 
 
 def clear_inflight_partial_marker(utterance_id: int) -> None:
-    inflight_partial_markers.pop(utterance_id, None)
+    with ui_lock:
+        inflight_partial_markers.pop(utterance_id, None)
+        entry = ui_state["left_active"].get(utterance_id)
+        if entry and entry.get("source_preview") is not None:
+            entry["source_preview"]["inflight"] = False
+
+
+def capture_utterance_active(utterance_id: int) -> bool:
+    # A read-only hint: do not take the endpoint lock while holding ui_lock.
+    # The capture path publishes UI changes while it owns that endpoint lock.
+    endpoint = ring_endpoint
+    if endpoint is not None:
+        return bool(endpoint.in_speech and endpoint.utterance_id == utterance_id)
+    return bool(in_speech and utterance_seq == utterance_id)
+
+
+def placeholder_only_entry(entry: dict | None) -> bool:
+    preview = entry.get("source_preview") if entry else None
+    return bool(preview is not None and not preview["text"] and not entry.get("src_final")
+                and not str(entry.get("dst", "")).strip())
+
+
+def prune_empty_source_placeholders(*, force: bool = False) -> None:
+    """Retire unused cards independently of ASR request timers or text caches."""
+    timeout_s = max(0.3, args.inflight_partial_timeout_ms / 1000.0)
+    now = time.perf_counter()
+    with ui_lock:
+        changed = False
+        for utterance_id, entry in list(ui_state["left_active"].items()):
+            if not placeholder_only_entry(entry):
+                continue
+            started_at = entry.setdefault("source_placeholder_since", now)
+            started_at = min(started_at, inflight_partial_markers.get(utterance_id, started_at))
+            if not force:
+                if now - started_at < timeout_s:
+                    continue
+                if capture_utterance_active(utterance_id) or is_final_asr_pending(utterance_id):
+                    continue
+            ui_remove_panel_entry("left", utterance_id)
+            inflight_partial_markers.pop(utterance_id, None)
+            changed = True
+        if changed:
+            render_dashboard()
 
 
 def sweep_inflight_partial_markers(active_utterances: set[int] | None = None) -> None:
-    if not args.stuck_partial_watchdog:
-        return
+    # Empty UI-card housekeeping must still run when the optional watchdog for
+    # real unfinished transcripts is disabled, or the request timer was cleared.
+    prune_empty_source_placeholders()
     timeout_s = max(0.3, args.inflight_partial_timeout_ms / 1000.0)
     now = time.perf_counter()
     active_utterances = active_utterances or set()
     expired: list[int] = []
     for utterance_id, started_at in list(inflight_partial_markers.items()):
-        if utterance_id in active_utterances:
+        if utterance_id in active_utterances or capture_utterance_active(utterance_id) or is_final_asr_pending(utterance_id):
             continue
         if now - started_at >= timeout_s:
             expired.append(utterance_id)
@@ -3222,16 +3320,11 @@ def sweep_inflight_partial_markers(active_utterances: set[int] | None = None) ->
         return
 
     with ui_lock:
-        changed = False
         for utterance_id in expired:
             inflight_partial_markers.pop(utterance_id, None)
             entry = ui_state["left_active"].get(utterance_id)
-            src = str(entry.get("src", "")) if entry else ""
-            if entry and "quality pending" in strip_ansi(src):
-                ui_remove_panel_entry("left", utterance_id)
-                changed = True
-        if changed:
-            render_dashboard()
+            if entry and entry.get("source_preview") is not None:
+                entry["source_preview"]["inflight"] = False
 
 
 APPLE_AUDIO_COOLDOWN_SECONDS = 3.0
@@ -5273,6 +5366,7 @@ class RingEndpointDetector:
 
     def reset_all(self) -> None:
         self.in_speech = False
+        self.audio_wall_clock_offset_ns = audio_wall_clock_offset_ns
         self.utterance_id = 0
         self.active: list[np.ndarray] = []
         self.pre_roll: list[np.ndarray] = []
@@ -5332,7 +5426,10 @@ class RingEndpointDetector:
         provenance = {"capture_gap": self.capture_gap, "frame_count": frame_count,
                       "timestamp_start_ns": times[0] if times else None,
                       "timestamp_end_ns": times[-1] + int(frames[-1].size) * 1_000_000_000 // SAMPLE_RATE if times and frames else None,
-                      "sample_rate": SAMPLE_RATE, "channels": 1}
+                      "sample_rate": SAMPLE_RATE, "channels": 1,
+                      "utterance_start_ns": self.active_timestamps[0] if self.active_timestamps else None,
+                      "utterance_samples": self.active_samples,
+                      "capture_wall_clock_offset_ns": self.audio_wall_clock_offset_ns}
         if times and frames and len(times) == len(frames):
             duration_ns = provenance["timestamp_end_ns"] - provenance["timestamp_start_ns"]
             expected_ns = int(pcm.size) * 1_000_000_000 // SAMPLE_RATE
@@ -5364,6 +5461,9 @@ class RingEndpointDetector:
             if frame.is_speech:
                 self.utterance_id += 1
                 self.in_speech = True
+                # Recalibrate for each new phrase (including after computer
+                # sleep), then keep that mapping fixed through its final decode.
+                self.audio_wall_clock_offset_ns = time.time_ns() - time.monotonic_ns()
                 reset_current_partial_state(next_utterance_id=self.utterance_id)
                 trace_update(self.utterance_id, speech_started_at=time.perf_counter())
                 # pre_roll already contains the triggering speech frame.
@@ -5404,7 +5504,9 @@ class RingEndpointDetector:
                 trace_update(self.utterance_id, partial_audio_ready_at=time.perf_counter())
                 count = min(len(self.active), max(1, int(args.partial_asr_window_seconds * 1000 / FRAME_MS)))
                 if self._submit_window(partial_pcm, True, count):
-                    show_inflight_partial_transcript(self.utterance_id)
+                    show_inflight_partial_transcript(self.utterance_id, audio_timing=capture_clip_timing(
+                        {"utterance_start_ns": self.active_timestamps[0], "utterance_samples": self.active_samples,
+                         "sample_rate": SAMPLE_RATE}, self.audio_wall_clock_offset_ns))
         if self.active_samples >= round(self.HARD_WINDOW_SECONDS * SAMPLE_RATE):
             self._finalize_locked(force=True, boundary_reason="hard_duration_limit", forced_speech_boundary=True)
             return
@@ -6985,13 +7087,7 @@ def coordinator_worker() -> None:
     global current_partial_stability, current_partial_last_change_ms, current_partial_locked_prefix, current_partial_locked_ratio, current_partial_revision, current_partial_utterance_id
 
     def watchdog_is_utterance_active(utterance_id: int) -> bool:
-        endpoint = ring_endpoint
-        if endpoint is None:
-            return False
-        try:
-            return bool(endpoint.in_speech and endpoint.utterance_id == utterance_id)
-        except Exception:
-            return False
+        return capture_utterance_active(utterance_id)
 
     def watchdog_clear_utterance(utterance_id: int) -> None:
         watchdog_partial_first_seen_by_utt.pop(utterance_id, None)
@@ -7192,11 +7288,10 @@ def coordinator_worker() -> None:
                     continue
                 result.text = sanitize_asr_text(result.text, final=False)
                 if not result.text:
-                    if not previous_text:
+                    if not previous_text and not capture_utterance_active(result.utterance_id) and not is_final_asr_pending(result.utterance_id):
                         with ui_lock:
                             entry = ui_state["left_active"].get(result.utterance_id)
-                            src = str(entry.get("src", "")) if entry else ""
-                            if entry and "quality pending" in strip_ansi(src):
+                            if placeholder_only_entry(entry):
                                 ui_remove_panel_entry("left", result.utterance_id)
                                 render_dashboard()
                     continue
@@ -7211,20 +7306,21 @@ def coordinator_worker() -> None:
                 )
                 previous_span = partial_source_spans.get(result.utterance_id)
                 current_span = final_transcript_audio_span(result)
-                partial_text = merge_partial_transcript_with_provenance(previous_text, result.text,
-                                                                          previous_span, current_span)
+                lock = stable_locks.get(result.utterance_id)
+                retained = " ".join(lock.stable_words) if lock is not None else ""
+                merged = merge_preview(previous_text, result.text, previous_span, current_span, retained)
+                if not merged.accepted:
+                    if args.debug:
+                        log_debug(f"retained visible preview utterance={result.utterance_id}: {merged.reason}")
+                    continue
+                partial_text = merged.text
                 revises_prefix = bool(
                     previous_text and previous_span is not None and current_span is not None
                     and previous_span[:3] == current_span[:3] and current_span[3] >= previous_span[3]
                     and not partial_text.startswith(previous_text)
                 )
-                if revises_prefix:
-                    # A corrected full-window hypothesis must not remain hidden
-                    # behind immutable words locked from the previous reading.
-                    stable_locks.pop(result.utterance_id, None)
-                    partial_display_cache.pop(result.utterance_id, None)
-                    partial_translation_candidates.pop(result.utterance_id, None)
-                    stable_translation_cache.pop(result.utterance_id, None)
+                # Tail corrections do not erase words already retained by the
+                # stability lock or restart the stable-prefix MT quiet timer.
                 if current_span is None or previous_span is None or current_span[3] >= previous_span[3]:
                     partial_source_spans[result.utterance_id] = current_span
                 prev_words = previous_text.split()
@@ -7296,15 +7392,16 @@ def coordinator_worker() -> None:
                         current_partial_locked_ratio = locked_ratio
                         current_partial_utterance_id = result.utterance_id
                         current_partial_revision = revision
-                display_is_inflight = not bool(display_text) or (args.partial_display_policy == "latest" and not display_locked_prefix)
                 with ui_lock:
                     ui_set_panel_entry(
                         "left",
                         result.utterance_id,
                         "src",
-                        format_partial_transcript_for_ui(display_text, display_locked_prefix, inflight=display_is_inflight),
+                        format_partial_transcript_for_ui(display_text, display_locked_prefix),
                         final=False,
                         revision=revision,
+                        preview=source_preview(display_text, display_locked_prefix, inflight=False),
+                        audio_timing=capture_clip_timing(result.diagnostics.get("request", {}), audio_wall_clock_offset_ns),
                     )
                     render_dashboard()
                 if args.stream_audio_translation and args.partial_translation_policy != "off":
@@ -7369,7 +7466,8 @@ def coordinator_worker() -> None:
             note_recent_final_transcript(result.utterance_id, final_text, final_audio_span, final_seen_at)
             reset_current_partial_state(result.utterance_id)
             with ui_lock:
-                ui_set_panel_entry("left", result.utterance_id, "src", f"🗣️ {source_label()}: {color_left_tr(final_text)}", final=True, revision=revision)
+                ui_set_panel_entry("left", result.utterance_id, "src", f"🗣️ {source_label()}: {color_left_tr(final_text)}", final=True, revision=revision,
+                                   audio_timing=capture_clip_timing(result.diagnostics.get("request", {}), audio_wall_clock_offset_ns))
                 render_dashboard()
             with session_log_lock:
                 audio_final_transcripts[result.utterance_id] = final_text
@@ -7396,6 +7494,7 @@ def coordinator_worker() -> None:
             if not result.partial:
                 clear_final_asr_pending(result.utterance_id)
             asr_results.task_done()
+            prune_empty_source_placeholders()
 
 def emit_best_effort_translation_result(emit, result: TranslationResult) -> None:
     """
@@ -8393,9 +8492,10 @@ def run_self_test() -> int:
         try:
             args.confidence_ui = True
             rendered = strip_ansi(format_partial_transcript_for_ui("merhaba dunya", "merhaba", inflight=True))
-            _assert_self_test("TR✓:" in rendered, "stable partial marker was not shown")
+            _assert_self_test("TR~:" in rendered, "partial was not marked provisional")
             _assert_self_test("dunya" in rendered, "unverified mutable tail was not shown")
-            _assert_self_test("quality pending" in rendered, "inflight quality-pending marker was not shown")
+            _assert_self_test(strip_ansi(format_partial_transcript_for_ui("", "", inflight=True)).endswith(": .."), "compact pending marker was not shown")
+            _assert_self_test("transcribing" not in rendered and ".." not in rendered, "busy marker replaced or distracted from visible words")
         finally:
             args.confidence_ui = old_confidence_ui
 
@@ -8493,7 +8593,7 @@ def run_self_test() -> int:
             ui_state.clear()
             ui_state.update(saved_state)
 
-    @check("Partial display uses stable text by default")
+    @check("Partial display supports immediate previews and opt-in stable text")
     def _test_partial_display_source_policy() -> None:
         old_policy = args.partial_display_policy
         old_min_words = args.partial_display_min_words
@@ -8793,10 +8893,14 @@ def main() -> int:
         return run_web_interface()
 
     validate_runtime_configuration()
-    initialize_session_runtime()
 
     if args.mode in {"audio", "both"}:
         ensure_audio_runtime()
+    capture_input = None
+    if args.mode in {"audio", "both"} and resolve_audio_io_backend() == "sounddevice":
+        capture_input = checked_input_device(sd, sounddevice_input_device(),
+                                             samplerate=SAMPLE_RATE, channels=CHANNELS, dtype=DTYPE)
+    initialize_session_runtime()
 
     streaming_engine = resolve_streaming_engine() if args.mode in {"audio", "both"} else "legacy"
     # Resolve metadata only. Every heavy model import/load/warmup belongs to
@@ -8914,7 +9018,7 @@ def main() -> int:
                             channels=CHANNELS,
                             dtype=DTYPE,
                             blocksize=FRAME_SAMPLES,
-                            device=sounddevice_input_device(),
+                            device=capture_input["index"],
                             callback=feeder.callback,
                         )
                     with audio_ctx as ctx:
@@ -8922,7 +9026,7 @@ def main() -> int:
                             audio_bridge = ctx  # same bridge handles playback via stdin
                             capture_label = f"apple_vpio_bridge mode={ctx.mode}"
                         else:
-                            capture_label = f"SoundDevice input={sounddevice_input_device()!r}"
+                            capture_label = f"SoundDevice input={capture_input['name']!r} (index {capture_input['index']})"
                         ui_update(status=f"🎙️ {capture_label} | ordered ring scheduler ON")
                         update_stage_status("capture", "listening", capture_label)
                         while True:
@@ -8942,7 +9046,7 @@ def main() -> int:
                         channels=CHANNELS,
                         dtype=DTYPE,
                         blocksize=FRAME_SAMPLES,
-                        device=sounddevice_input_device(),
+                        device=capture_input["index"],
                         callback=audio_callback,
                     )
                 with audio_ctx as ctx:
@@ -8976,6 +9080,7 @@ def main() -> int:
         shutdown_event.set()
         stop_asr_process()
         stop_mt_process()
+        prune_empty_source_placeholders(force=True)
         audio_bridge = None
         active_ring_feeder = None
         if audio_evidence is not None:

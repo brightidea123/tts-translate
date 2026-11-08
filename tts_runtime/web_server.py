@@ -242,7 +242,8 @@ def create_app(controller, assets_dir: str | Path = ROOT / "web") -> FastAPI:
             return found
         if not isinstance(found, list):
             raise HTTPException(status_code=500, detail="Controller devices must be a list")
-        return {"devices": found}
+        error = getattr(controller, "device_error", "")
+        return {"devices": found, **({"error": error} if error else {})}
 
     @app.post("/api/start")
     async def start(config: StartConfig):

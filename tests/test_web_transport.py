@@ -125,6 +125,25 @@ class HeadlessTransportTests(unittest.TestCase):
 
 
 class WebSnapshotTests(unittest.TestCase):
+    def test_preview_sends_plain_words_with_stable_and_provisional_spans(self):
+        ui = {"left_active": {1: {
+            "src": "HE~: formatted terminal text", "src_final": False,
+            "source_preview": {"text": "שלום עולם (test)", "stable": "שלום", "inflight": True},
+        }}, "left_order": [1]}
+        message = build_web_snapshot(ui, {"source_language": "HE", "target_language": "AR"}, "s", True, "off", None)["transcript"][0]
+        self.assertEqual(message["source"], "שלום עולם (test)")
+        self.assertEqual(message["source_stable"], "שלום")
+        self.assertEqual(message["source_provisional"], " עולם (test)")
+        self.assertTrue(message["source_inflight"])
+        self.assertFalse(message["source_final"])
+        ui["left_active"][1]["source_preview"] = {"text": "", "stable": "", "inflight": True}
+        pending = build_web_snapshot(ui, {}, "s", True, "off", None)["transcript"][0]
+        self.assertEqual(pending["source"], "")
+        ui["left_active"][1]["src_final"] = True
+        final = build_web_snapshot(ui, {}, "s", True, "off", None)["transcript"][0]
+        self.assertEqual(final["source"], "formatted terminal text")
+        self.assertNotIn("source_provisional", final)
+
     def test_rtl_text_markup_and_punctuation_are_preserved_without_console_labels(self):
         source = "שלום (123), مرحباً <note> x < y\nשורה חדשה"
         translated = "مرحباً بالعالم؛ שלום!"

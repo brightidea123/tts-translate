@@ -78,6 +78,13 @@ class WebServerTests(unittest.TestCase):
     def client(self, **kwargs):
         return TestClient(self.app, base_url=BASE_URL, client=("127.0.0.1", 50000), **kwargs)
 
+    def test_device_discovery_error_is_returned_to_the_page(self):
+        self.controller.device_error = "No audio inputs found; check LitLink's input route"
+        with self.client() as client, patch.object(self.controller, "devices", return_value=[]):
+            payload = client.get("/api/devices").json()
+            self.assertEqual(payload["devices"], [])
+            self.assertEqual(payload["error"], self.controller.device_error)
+
     def test_static_state_devices_and_all_command_boundaries(self):
         with self.client() as client:
             self.assertIn("Local translator", client.get("/").text)

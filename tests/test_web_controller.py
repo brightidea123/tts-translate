@@ -9,7 +9,6 @@ import subprocess
 import sys
 import tempfile
 import threading
-from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -279,16 +278,15 @@ class WebControllerTests(unittest.TestCase):
         self.assertTrue(any(call.args == (process.pid, signal.SIGINT) for call in self.killpg.call_args_list))
 
     def test_devices_are_lazy_input_only_and_enumeration_errors_are_visible(self):
-        sd = SimpleNamespace(default=SimpleNamespace(device=[1, -1]), query_devices=lambda: [
-            {"name": "Speakers", "max_input_channels": 0, "default_samplerate": 48000},
-            {"name": "LitLink", "max_input_channels": 2, "default_samplerate": 48000},
-            {"name": "Microphone", "max_input_channels": 1, "default_samplerate": 16000},
-        ])
-        with patch.dict(sys.modules, {"sounddevice": sd}):
+        with patch("tts_runtime.web_controller.fresh_input_devices") as discover:
+            discover.return_value = [{"id": "LitLink", "index": 1, "default": True}, {"id": "Microphone", "index": 2}]
             devices = self.controller.devices()
-            self.assertEqual([device["id"] for device in devices], [1, 2])
+            self.assertEqual([device["id"] for device in devices], ["LitLink", "Microphone"])
             self.assertTrue(devices[0]["default"])
-            sd.query_devices = lambda: (_ for _ in ()).throw(RuntimeError("unavailable"))
+            discover.return_value = []
+            self.assertEqual(self.controller.devices(), [])
+            self.assertIn("No audio inputs", self.controller.device_error)
+            discover.side_effect = RuntimeError("unavailable")
             self.assertEqual(self.controller.devices(), [])
             self.assertIn("unavailable", self.controller.state()["device_error"])
         self.assertEqual(self.launches, [])
