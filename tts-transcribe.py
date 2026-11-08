@@ -12,6 +12,9 @@ Pipeline goals:
 from __future__ import annotations
 
 import argparse
+import codecs
+import hashlib
+from collections import deque
 from datetime import datetime, timezone
 from contextlib import ExitStack, nullcontext, redirect_stderr, redirect_stdout
 import importlib
@@ -24,6 +27,7 @@ from multiprocessing import shared_memory
 import os
 import re
 from functools import lru_cache
+from heapq import heapify
 import shlex
 import select
 import shutil
@@ -45,6 +49,15 @@ from typing import Iterator, Literal
 
 import numpy as np
 
+from translation_prompts import build_translation_messages
+from tts_runtime.worker import ProcessStage, StageEvent
+from tts_runtime.text_output import clean_model_output, configure_translation_stop_tokens
+from tts_runtime.asr_quality import pcm_quality, summarize_whisper_result, issue_reasons, final_preview_disagrees
+from tts_runtime.audio_evidence import AudioEvidence, create_session_directory
+from tts_runtime.model_assets import resolve_mlx_whisper_reference, require_cached_mlx_whisper, LARGE_V3_REPOSITORY
+from tts_runtime.selection_inference import SelectionTask, SelectionResult
+from optional_dependencies import optional_dependency
+
 
 def eprint(*args, **kwargs) -> None:
     """Write diagnostics to stderr so stdout stays reserved for interactive UI or data."""
@@ -63,21 +76,18 @@ try:
 except ImportError:
     webrtcvad = None
 
-try:
-    import torch
-except ImportError:
-    torch = None
+def _configure_torch_runtime(module) -> None:
+    if hasattr(module, "set_float32_matmul_precision"):
+        module.set_float32_matmul_precision("high")
+    mps = getattr(getattr(module, "backends", None), "mps", None)
+    if mps is not None and hasattr(mps, "allow_tf32"):
+        mps.allow_tf32 = True
 
-try:
-    from faster_whisper import WhisperModel
-except ImportError:
-    WhisperModel = None
 
-try:
-    from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
-except ImportError:
-    AutoModelForSeq2SeqLM = None
-    AutoTokenizer = None
+torch = optional_dependency("torch", configure=_configure_torch_runtime)
+WhisperModel = optional_dependency("faster_whisper", "WhisperModel")
+AutoModelForSeq2SeqLM = optional_dependency("transformers", "AutoModelForSeq2SeqLM")
+AutoTokenizer = optional_dependency("transformers", "AutoTokenizer")
 
 mlx_whisper = None
 mlx_whisper_import_error: Exception | None = None
@@ -101,18 +111,29 @@ mlx_vlm_thread_state = threading.local()
 mlx_lm_load = None
 mlx_lm_stream_generate = None
 mlx_lm_import_error: Exception | None = None
+mlx_translation_stop_ids: frozenset[int] = frozenset()
+runtime_session_id = ""
+runtime_session_dir: Path | None = None
+runtime_audio_dir: Path | None = None
+audio_review_mode = "off"
+audio_evidence: AudioEvidence | None = None
+asr_request_context: dict = {}
+last_asr_diagnostics: dict = {}
+last_decoder_quality: dict = {}
+last_prepared_audio: np.ndarray | None = None
+asr_request_sequence = 0
+pending_audio_evidence: dict = {}
+active_ring_feeder = None
 MLX_LM_INSTALLED = importlib.util.find_spec("mlx_lm") is not None
 SILERO_VAD_INSTALLED = importlib.util.find_spec("silero_vad") is not None
 ONNXRUNTIME_INSTALLED = importlib.util.find_spec("onnxruntime") is not None
 
-try:
-    from kokoro_onnx import Kokoro
-except ImportError:
-    Kokoro = None
+Kokoro = optional_dependency("kokoro_onnx", "Kokoro")
 
 warnings.filterwarnings("ignore", message="pkg_resources is deprecated as an API")
 warnings.filterwarnings("ignore", message=r"You are using a model of type `gemma4` to instantiate a model of type ``.*")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 os.environ.setdefault("HF_HUB_DISABLE_IMPLICIT_TOKEN", "1")
@@ -125,19 +146,9 @@ logging.getLogger("transformers.configuration_utils").setLevel(logging.ERROR)
 logging.getLogger("transformers.modeling_utils").setLevel(logging.ERROR)
 logging.getLogger("httpx").setLevel(logging.ERROR)
 logging.getLogger("httpcore").setLevel(logging.ERROR)
-try:
-    from transformers.utils import logging as transformers_logging
-    transformers_logging.set_verbosity_error()
-except Exception:
-    pass
-
-if torch is not None and hasattr(torch, "set_float32_matmul_precision"):
-    torch.set_float32_matmul_precision("high")
-if torch is not None and hasattr(torch.backends, "mps") and hasattr(torch.backends.mps, "allow_tf32"):
-    torch.backends.mps.allow_tf32 = True
-
-
-
+logging.getLogger("torch.distributed.elastic.multiprocessing.redirects").addFilter(
+    lambda record: record.getMessage() != "NOTE: Redirects are currently not supported in MacOs."
+)
 @dataclass(frozen=True, slots=True)
 class LanguageSpec:
     cli: str
@@ -289,7 +300,7 @@ parser.add_argument("--auto-detect-asr-language", dest="force_asr_language", act
 parser.add_argument("--asr-initial-prompt", default="", help="optional prior-transcript hint for Whisper; leave empty to avoid prompt-language leakage")
 parser.add_argument("--allow-english-asr-model", action="store_true", default=False, help="allow .en Whisper models even when source language is not English")
 parser.add_argument("--profile", choices=["live", "balanced", "accurate", "stable", "m4-max-live"], default="live", help="bundle of latency/accuracy defaults; stable enables stricter anti-repeat/anti-hallucination gates")
-parser.add_argument("--whisper-model", default="small", help="tiny|base|small|medium|large-v3|large-v3-turbo")
+parser.add_argument("--whisper-model", default="large-v3", help="local model path or multilingual Whisper model name")
 parser.add_argument("--whisper-compute", default="int8", help="faster-whisper compute type")
 parser.add_argument("--stt-backend", choices=["auto", "mlx-vlm-gemma", "mlx-whisper", "dictate-stt", "faster-whisper", "whisper-cli"], default="auto", help="speech-to-text backend")
 parser.add_argument("--partial-stt-backend", choices=["same", "auto", "mlx-vlm-gemma", "mlx-whisper", "dictate-stt", "faster-whisper", "whisper-cli", "apple-speech"], default="same", help="optional partial-only ASR backend; apple-speech requires --apple-speech-command")
@@ -299,7 +310,7 @@ parser.add_argument("--asr-beam", type=int, default=3, help="higher = more accur
 parser.add_argument("--partial-asr-beam", type=int, default=1, help="beam size for partial ASR lane")
 parser.add_argument("--final-asr-beam", type=int, default=0, help="beam size for final ASR lane; 0 means use --asr-beam")
 parser.add_argument("--partial-whisper-model", default="", help="optional faster partial model, e.g. base or small; empty uses --whisper-model")
-parser.add_argument("--final-whisper-model", default="", help="optional accurate final model, e.g. large-v3-turbo; empty uses --whisper-model")
+parser.add_argument("--final-whisper-model", default="", help="optional accurate final model, e.g. large-v3; empty uses --whisper-model")
 parser.add_argument("--mlx-vlm-model", default="mlx-community/gemma-4-e4b-it-4bit", help="MLX-VLM audio model for --stt-backend mlx-vlm-gemma")
 parser.add_argument("--partial-mlx-vlm-model", default="", help="optional partial-only MLX-VLM audio model; empty uses --mlx-vlm-model")
 parser.add_argument("--final-mlx-vlm-model", default="", help="optional final-only MLX-VLM audio model; empty uses --mlx-vlm-model")
@@ -313,15 +324,15 @@ parser.add_argument("--stuck-partial-timeout-ms", type=int, default=6500, help="
 parser.add_argument("--inflight-partial-timeout-ms", type=int, default=2200, help="remove UI-only in-flight partial markers if ASR returns no text/result within this many ms")
 parser.add_argument("--terminal-lam-alef-divider-compensation", type=int, default=1, help="move the dashboard divider right by this many cells per lam-alef on the same left-panel row; set 0 to disable")
 parser.add_argument("--final-transcription-log-debounce-ms", type=int, default=1200, help="wait this long before appending final audio transcription logs so later same-utterance refinements replace earlier ones")
-parser.add_argument("--final-dedupe-window-ms", type=int, default=45000, help="suppress near-duplicate finalized audio transcripts emitted within this recent window; set 0 to disable")
-parser.add_argument("--final-dedupe-contained-ratio", type=float, default=0.78, help="minimum smaller-word-set containment ratio for near-duplicate final transcript suppression")
-parser.add_argument("--stuck-partial-action", choices=["finalize", "close"], default="finalize", help="watchdog action for stale partials: finalize from last partial text, or close/remove the UI entry")
+parser.add_argument("--final-dedupe-window-ms", type=int, default=45000, help="suppress exact repeated final text only over proven overlapping source audio within this window; set 0 to disable")
+parser.add_argument("--final-dedupe-contained-ratio", type=float, default=0.78, help="legacy reserved option; fuzzy text-only final suppression is disabled")
+parser.add_argument("--stuck-partial-action", choices=["finalize", "close"], default="close", help="watchdog action for stale partials: explicitly opt in to finalizing from a partial, or close/remove it")
 parser.add_argument("--no-stuck-partial-watchdog", dest="stuck_partial_watchdog", action="store_false", help="disable stuck partial cleanup watchdog")
 parser.set_defaults(stuck_partial_watchdog=True)
-parser.add_argument("--empty-final-action", choices=["fallback", "close", "keep"], default="fallback", help="when final ASR is empty after filtering: fallback to last partial, close UI entry, or keep waiting")
-parser.add_argument("--final-merge-last-partial", action="store_true", default=True, help="merge final ASR with the last partial when it preserves details")
+parser.add_argument("--empty-final-action", choices=["fallback", "close", "keep"], default="close", help="when final ASR is empty after filtering: fallback to last partial, close UI entry, or keep waiting")
+parser.add_argument("--final-merge-last-partial", action="store_true", default=False, help="opt in to merging final ASR with an earlier partial; disabled to preserve authoritative final text")
 parser.add_argument("--no-final-merge-last-partial", dest="final_merge_last_partial", action="store_false")
-parser.add_argument("--final-translation-completeness-mode", choices=["off", "conservative", "aggressive"], default="conservative", help="how strongly final audio translation should recover details from the last partial")
+parser.add_argument("--final-translation-completeness-mode", choices=["off", "conservative", "aggressive"], default="off", help="how strongly final audio translation should recover details from the last partial")
 parser.add_argument("--final-merge-min-final-words", type=int, default=4, help="merge from the last partial when final ASR has fewer words than this")
 parser.add_argument("--debug-dropped-asr", action="store_true", default=False, help="log ASR text dropped by sanitizers/language guards")
 parser.add_argument("--native-script-min-ratio", type=float, default=0.25, help="minimum native-script letter ratio required for final ASR in strict native-script mode")
@@ -340,11 +351,14 @@ parser.add_argument("--min-text-words", type=int, default=1, help="reject transc
 parser.add_argument("--apple-vpio-agc", choices=["on", "off"], default="on", help="Apple VoiceProcessingIO automatic gain control")
 parser.add_argument("--apple-vpio-bypass-processing", choices=["on", "off"], default="off", help="bypass Apple voice processing while keeping the same native audio unit path")
 parser.add_argument("--translation-backend", choices=["auto", "mlx-vlm-gemma", "mlx-lm", "nllb"], default="auto", help="translation backend")
-parser.add_argument("--translation-model", default="mlx-community/Meta-Llama-3.1-8B-Instruct-4bit")
+parser.add_argument("--translation-model", default="mlx-community/translategemma-12b-it-4bit")
 parser.add_argument("--mt-prompt", default="", help="optional MLX-LM translation prompt/instructions; supports {source_language}, {target_language}, and {text}; if {text} is omitted, it is added to the default translation prompt")
 parser.add_argument("--mt-beams", type=int, default=4, help="translation beam size")
 parser.add_argument("--mt-process", action="store_true", default=True, help="run translation in a separate process so the UI/coordinator stays responsive")
 parser.add_argument("--no-mt-process", dest="mt_process", action="store_false")
+parser.add_argument("--startup-timeout", type=float, default=180.0, help="maximum seconds for each model worker to initialize; failures stay visible in the dashboard")
+parser.add_argument("--inference-timeout", type=float, default=120.0, help="maximum seconds for one model request before its worker is stopped")
+parser.add_argument("--inference-queue-size", type=int, default=16, help="bounded pending requests per model worker; overflow is reported without blocking capture or typing")
 parser.add_argument("--mt-queue-size", type=int, default=3, help="max pending translation tasks before stale speculative audio translations are dropped")
 parser.add_argument("--mt-chunk-max-chars", type=int, default=1800, help="max source chars per MLX-LM translation request; larger values preserve context, <=0 disables MLX chunking")
 parser.add_argument("--stream-mt-deltas", action="store_true", default=True, help="emit display-only MLX-LM translation deltas while chunks are still generating")
@@ -352,8 +366,8 @@ parser.add_argument("--no-stream-mt-deltas", dest="stream_mt_deltas", action="st
 parser.add_argument("--mt-delta-min-chars", type=int, default=16, help="minimum changed characters before another streaming translation display update")
 parser.add_argument("--mt-delta-min-ms", type=int, default=70, help="minimum time between small streaming translation display updates")
 parser.add_argument("--tts", choices=["auto", "kokoro", "say", "piper", "edge"], default="auto")
-parser.add_argument("--say-voice", default="Yelda", help="macOS Turkish voice if installed")
-parser.add_argument("--edge-voice", default="tr-TR-EmelNeural")
+parser.add_argument("--say-voice", default="", help="optional macOS voice override; otherwise select an installed voice matching the spoken language")
+parser.add_argument("--edge-voice", default="", help="optional source-language Edge voice override; otherwise use the spoken language's voice")
 parser.add_argument("--rate", type=float, default=1.0, help="edge-tts rate multiplier")
 parser.add_argument("--kokoro-model", default=os.path.expanduser("~/models/kokoro/kokoro-v1.0.onnx"), help="path to Kokoro ONNX model")
 parser.add_argument("--kokoro-voices", default=os.path.expanduser("~/models/kokoro/voices-v1.0.bin"), help="path to Kokoro voices bundle")
@@ -363,10 +377,10 @@ parser.add_argument("--kokoro-lang-en", default="en-us", help="Kokoro language c
 parser.add_argument("--kokoro-lang-tr", default="tr", help="Kokoro language code for Turkish output")
 parser.add_argument("--tts-speed", type=float, default=1.0, help="local TTS speed multiplier")
 parser.add_argument("--input-device", help="sounddevice input device name or index")
-parser.add_argument("--audio-io", choices=["auto", "sounddevice", "apple-raw", "apple-vpio"], default="auto", help="audio capture/playback backend")
-parser.add_argument("--streaming-engine", choices=["auto", "ring", "legacy"], default="auto", help="audio streaming engine: ring uses apple_vpio_bridge PCM frames + priority ASR; legacy uses the older queue pipeline")
+parser.add_argument("--audio-io", choices=["auto", "sounddevice", "apple-raw", "apple-vpio"], default="sounddevice", help="audio capture/playback backend")
+parser.add_argument("--streaming-engine", choices=["auto", "ring", "legacy"], default="ring", help="audio streaming engine: ring uses ordered timestamped PCM frames + priority ASR with any capture backend; legacy uses the older queue pipeline")
 parser.add_argument("--apple-bridge-path", default=str(Path(__file__).with_name("apple_vpio_bridge")), help="path to Swift AVAudioEngine/VPIO bridge used for capture + playback")
-parser.add_argument("--ring-buffer-seconds", type=float, default=30.0, help="seconds of timestamped audio to keep in the native ring buffer")
+parser.add_argument("--ring-buffer-seconds", type=float, default=30.0, help="seconds of timestamped audio history to keep in the ring buffer")
 parser.add_argument("--translation-stable-only", action="store_true", default=True, help="legacy alias: translate only stable ASR prefix for audio partials")
 parser.add_argument("--no-translation-stable-only", dest="translation_stable_only", action="store_false")
 parser.add_argument("--partial-translation-policy", choices=["stable", "speculative", "off"], default="stable", help="audio partial MT policy: stable=translate only locked prefix, speculative=display-only MT for changed partials, off=no partial MT")
@@ -388,7 +402,7 @@ parser.add_argument("--strict-min-dbfs", type=float, default=-62.0, help="minimu
 parser.add_argument("--strict-no-speech-prob", type=float, default=0.55, help="stricter no-speech threshold used when anti-repeat is strict")
 parser.add_argument("--strict-min-avg-logprob", type=float, default=-1.0, help="stricter average logprob threshold used when anti-repeat is strict")
 parser.add_argument("--strict-max-compression-ratio", type=float, default=2.4, help="stricter compression-ratio threshold used when anti-repeat is strict")
-parser.add_argument("--known-hallucination-filter", choices=["auto", "off", "on", "strict"], default="auto", help="remove common Whisper subtitle-credit hallucinations such as 'Altyazı M. K.'; auto=on for stable profile")
+parser.add_argument("--known-hallucination-filter", choices=["auto", "off", "on", "strict"], default="auto", help="remove common Whisper subtitle-credit phrases; auto=on with anti-repeat or stable profile; off preserves even those phrases")
 parser.add_argument("--extra-hallucination-phrases", default="", help="extra hallucination phrases to remove, separated by ||, e.g. 'phrase one||phrase two'")
 parser.add_argument("--hallucination-phrase-file", default="", help="optional UTF-8 text file with one hallucination phrase per line")
 parser.add_argument("--disable-vpio-bandpass", action="store_true", default=True, help="skip FFT bandpass in the hot ASR path when using Apple VPIO/ring capture")
@@ -399,7 +413,14 @@ parser.add_argument("--output-wav", default="output.wav", help="path for generat
 parser.add_argument("--warmup", action="store_true", default=True, help="warm up models at startup for faster first response")
 parser.add_argument("--no-warmup", dest="warmup", action="store_false")
 parser.add_argument("--verbose", action="store_true", help="show runtime status messages")
-parser.add_argument("--debug", action="store_true", help="show verbose low-level diagnostics")
+parser.add_argument("--debug", action="store_true", help="show diagnostics and, by default, save the full incoming audio stream for review")
+parser.add_argument("--audio-review", choices=["auto", "off", "issues", "full"], default="auto", help="audio evidence: auto records full input with --debug, otherwise only flagged ASR clips")
+parser.add_argument("--recordings-dir", default="recordings", help="base directory for isolated per-session audio evidence")
+parser.add_argument("--issue-audio-budget-mb", type=int, default=256, help="per-writer byte budget for issue clips; recording stops visibly at the limit")
+parser.add_argument("--asr-preprocessing", choices=["raw", "legacy"], default="raw", help="raw 16 kHz PCM conversion (default) or legacy bandpass/pre-emphasis/gain for comparison")
+parser.add_argument("--ui", choices=["terminal", "web", "headless"], default="terminal", help="terminal interface or local responsive web UI; headless is the web backend transport")
+parser.add_argument("--web-host", default="127.0.0.1", help="local web UI bind address")
+parser.add_argument("--web-port", type=int, default=8765, help="local web UI port")
 parser.add_argument("--dump-config", action="store_true", help="print effective config and exit")
 parser.add_argument("--self-test", action="store_true", help="run fast local pipeline invariants without opening audio devices or loading live models")
 parser.add_argument("--stream-audio-translation", action="store_true", default=True, help="print audio translations chunk-by-chunk when useful")
@@ -456,8 +477,8 @@ USER_SET_TRANSLATION_MODEL = "--translation-model" in EXPLICIT_FLAGS
 
 PROFILE_DEFAULTS = {
     "live": {
-        "whisper_model": "large-v3-turbo",
-        "translation_model": "mlx-community/Meta-Llama-3.1-8B-Instruct-4bit",
+        "whisper_model": "large-v3",
+        "translation_model": "mlx-community/translategemma-12b-it-4bit",
         "asr_beam": 2,
         "mt_beams": 3,
         "mt_queue_size": 2,
@@ -474,22 +495,22 @@ PROFILE_DEFAULTS = {
         "min_speech_frames": 5,
         "min_speech_ratio": 0.16,
         "audio_queue_size": 1,
-        "capture_queue_ms": 160,
+        "capture_queue_ms": 2000,
         "tts_queue_size": 1,
-        "streaming_asr_chunk_seconds": 0.64,
+        "streaming_asr_chunk_seconds": 1.0,
         "streaming_asr_overlap_ms": 240,
-        "partial_asr_window_seconds": 1.8,
+        "partial_asr_window_seconds": 6.0,
         "partial_translation_min_delta_words": 2,
         "playback_guard_ms": 500,
     },
     "m4-max-live": {
-        "whisper_model": "large-v3-turbo",
-        "partial_whisper_model": "large-v3-turbo",
-        "final_whisper_model": "large-v3-turbo",
+        "whisper_model": "large-v3",
+        "partial_whisper_model": "large-v3",
+        "final_whisper_model": "large-v3",
         "mlx_vlm_model": "mlx-community/gemma-4-e4b-it-4bit",
         "stt_backend": "mlx-whisper",
         "translation_backend": "mlx-lm",
-        "translation_model": "mlx-community/Meta-Llama-3.1-8B-Instruct-4bit",
+        "translation_model": "mlx-community/translategemma-12b-it-4bit",
         "audio_io": "apple-vpio",
         "streaming_engine": "ring",
         "asr_beam": 2,
@@ -505,9 +526,9 @@ PROFILE_DEFAULTS = {
         "stable_translation_min_words": 3,
         "translation_stable_only": True,
         "partial_queue_latest_only": True,
-        "streaming_asr_chunk_seconds": 0.85,
+        "streaming_asr_chunk_seconds": 1.0,
         "streaming_asr_overlap_ms": 220,
-        "partial_asr_window_seconds": 2.2,
+        "partial_asr_window_seconds": 6.0,
         "vad_hangover_ms": 140,
         "tail_pad_ms": 90,
         "silence_base_ms": 360,
@@ -518,14 +539,14 @@ PROFILE_DEFAULTS = {
         "adapt_alpha": 0.32,
         "min_speech_frames": 5,
         "min_speech_ratio": 0.16,
-        "capture_queue_ms": 160,
+        "capture_queue_ms": 2000,
         "audio_queue_size": 1,
         "playback_guard_ms": 500,
     },
     "balanced": {
-        "whisper_model": "large-v3-turbo",
+        "whisper_model": "large-v3",
         "mlx_vlm_model": "mlx-community/gemma-4-e4b-it-4bit",
-        "translation_model": "mlx-community/Meta-Llama-3.1-8B-Instruct-4bit",
+        "translation_model": "mlx-community/translategemma-12b-it-4bit",
         "asr_beam": 3,
         "mt_beams": 4,
         "mt_queue_size": 3,
@@ -551,8 +572,8 @@ PROFILE_DEFAULTS = {
         "playback_guard_ms": 600,
     },
     "stable": {
-        "whisper_model": "large-v3-turbo",
-        "translation_model": "mlx-community/Meta-Llama-3.1-8B-Instruct-4bit",
+        "whisper_model": "large-v3",
+        "translation_model": "mlx-community/translategemma-12b-it-4bit",
         "asr_beam": 2,
         "mt_beams": 4,
         "mt_queue_size": 2,
@@ -592,8 +613,8 @@ PROFILE_DEFAULTS = {
         "playback_guard_ms": 650,
     },
     "accurate": {
-        "whisper_model": "large-v3-turbo",
-        "translation_model": "mlx-community/Meta-Llama-3.1-8B-Instruct-4bit",
+        "whisper_model": "large-v3",
+        "translation_model": "mlx-community/translategemma-12b-it-4bit",
         "asr_beam": 5,
         "mt_beams": 5,
         "mt_queue_size": 5,
@@ -665,7 +686,7 @@ DEFAULT_MIN_TEXT_WORDS = 1
 # Translation chunking.
 NLLB_SRC_TOKEN_BUDGET = 220
 NLLB_MAX_NEW_TOKENS = 220
-DEFAULT_MLX_TRANSLATION_MODEL = "mlx-community/Meta-Llama-3.1-8B-Instruct-4bit"
+DEFAULT_MLX_TRANSLATION_MODEL = "mlx-community/translategemma-12b-it-4bit"
 DEFAULT_NLLB_TRANSLATION_MODEL = "facebook/nllb-200-distilled-600M"
 DEFAULT_MLX_VLM_AUDIO_MODEL = "mlx-community/gemma-4-e4b-it-4bit"
 def stt_initial_prompt() -> str | None:
@@ -726,6 +747,11 @@ def effective_config() -> dict:
         "warmup": args.warmup,
         "verbose": args.verbose,
         "debug": args.debug,
+        "audio_review": args.audio_review,
+        "audio_review_mode": resolved_audio_review_mode(),
+        "asr_preprocessing": args.asr_preprocessing,
+        "session_id": runtime_session_id,
+        "ui": args.ui,
         "stream_audio_translation": args.stream_audio_translation,
         "partial_translation_policy": args.partial_translation_policy,
         "anti_repeat": resolved_anti_repeat_level(),
@@ -777,6 +803,10 @@ def effective_config() -> dict:
         "asr_beam": args.asr_beam,
         "mt_beams": args.mt_beams,
         "mt_process": args.mt_process,
+        "inference_queue_size": args.inference_queue_size,
+        "startup_timeout": args.startup_timeout,
+        "inference_timeout": args.inference_timeout,
+        "model_execution": "supervised processes; capture/UI/results/playback threads",
         "mt_queue_size": args.mt_queue_size,
         "mt_chunk_max_chars": args.mt_chunk_max_chars,
         "stream_mt_deltas": args.stream_mt_deltas,
@@ -831,6 +861,44 @@ def effective_config() -> dict:
         "mlx_whisper_python_installed": MLX_WHISPER_INSTALLED,
         "mlx_lm_python_installed": MLX_LM_INSTALLED,
     }
+
+
+def resolved_audio_review_mode() -> str:
+    return ("full" if args.debug else "issues") if args.audio_review == "auto" else args.audio_review
+
+
+def initialize_session_runtime() -> None:
+    """Isolate every launch's generated audio, logs and diagnostic artifacts."""
+    global runtime_session_id, runtime_session_dir, runtime_audio_dir, audio_evidence, audio_review_mode
+    root = Path(__file__).resolve().parent
+    audio_review_mode = resolved_audio_review_mode()
+    if audio_review_mode != "off":
+        runtime_audio_dir = create_session_directory(Path(args.recordings_dir))
+        runtime_session_id = runtime_audio_dir.name
+        runtime_session_dir = root / "runtime-reports" / "sessions" / runtime_session_id
+        runtime_session_dir.mkdir(parents=True, exist_ok=True)
+        audio_evidence = AudioEvidence(runtime_audio_dir, role="capture", full_stream=audio_review_mode == "full",
+                                       max_clip_bytes=args.issue_audio_budget_mb * 1024 * 1024)
+    else:
+        runtime_audio_dir = None
+        runtime_session_dir = create_session_directory(root / "runtime-reports" / "sessions")
+        runtime_session_id = runtime_session_dir.name
+    os.environ["TTS_TRANSLATE_SESSION_DIR"] = str(runtime_session_dir)
+    os.environ["TTS_TRANSLATE_SESSION_ID"] = runtime_session_id
+    os.environ["TTS_TRANSLATE_AUDIO_DIR"] = str(runtime_audio_dir or "")
+    os.environ["TTS_TRANSLATE_AUDIO_MODE"] = audio_review_mode
+    if "--output-wav" not in EXPLICIT_FLAGS:
+        args.output_wav = str(runtime_session_dir / "reply.wav")
+    if "--transcription-log" not in EXPLICIT_FLAGS:
+        args.transcription_log = str(runtime_session_dir / "transcription.log")
+    if "--tts-log" not in EXPLICIT_FLAGS:
+        args.tts_log = str(runtime_session_dir / "tts.log")
+    metadata = {"session_id": runtime_session_id, "pid": os.getpid(),
+                "config": effective_config(), "recording_directory": str(runtime_audio_dir or ""),
+                "recording_policy": audio_review_mode, "quality_flags_are_not_accuracy_measurements": True}
+    (runtime_session_dir / "session.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+    if audio_evidence is not None:
+        audio_evidence.event({"type": "session", **metadata})
 
 
 @dataclass(slots=True)
@@ -893,6 +961,10 @@ class AsrResult:
     partial: bool
     shm_name: str | None = None
     slot_id: int | None = None
+    request_id: str = ""
+    session_id: str = ""
+    pcm_sha256: str = ""
+    diagnostics: dict = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -935,6 +1007,10 @@ class TtsTask:
 # Terminal setup
 # ======================
 stdin_fd: int | None = None
+stdin_characters: deque[str] = deque()
+stdin_decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+headless_line_buffer = ""
+headless_transport = None
 old_settings = None
 ui_lock = threading.Lock()
 ui_initialized = False
@@ -948,6 +1024,7 @@ ui_state = {
     "right_order": [],
     "input": "",
     "status": "",
+    "stages": {},
 }
 inflight_partial_markers: dict[int, float] = {}
 text_entry_seq = 0
@@ -955,9 +1032,17 @@ text_entry_seq = 0
 
 def setup_terminal() -> None:
     global stdin_fd, old_settings
+    if args.ui == "headless":
+        global headless_transport
+        from tts_runtime.web_transport import HeadlessTransport
+        stdin_fd = sys.stdin.fileno()
+        headless_transport = HeadlessTransport(stdin_fd, sys.stdout, process_headless_action, async_output=True)
+        return
     if not sys.stdin.isatty():
         raise RuntimeError("stdin is not a TTY; interactive keyboard mode is required")
     stdin_fd = sys.stdin.fileno()
+    stdin_characters.clear()
+    stdin_decoder.reset()
     old_settings = termios.tcgetattr(stdin_fd)
     tty.setcbreak(stdin_fd)
     sys.stdout.write("\x1b[?25l")
@@ -965,6 +1050,8 @@ def setup_terminal() -> None:
 
 
 def restore_terminal() -> None:
+    if args.ui == "headless":
+        return
     if getattr(render_dashboard, '_alt', False):
         sys.stdout.write("\x1b[?1049l")
         render_dashboard._alt = False
@@ -975,10 +1062,23 @@ def restore_terminal() -> None:
 
 
 def read_key(timeout: float = 0.05) -> str | None:
+    if args.ui == "headless":
+        return read_headless_command(timeout)
     if stdin_fd is None:
         return None
-    if select.select([sys.stdin], [], [], timeout)[0]:
-        return sys.stdin.read(1)
+    if stdin_characters:
+        return stdin_characters.popleft()
+    if select.select([stdin_fd], [], [], timeout)[0]:
+        # TextIO.read(1) may prefetch the remaining pasted text/Enter into its
+        # own buffer. select() then sees an empty FD and never drains those
+        # characters. Read bytes once, decode UTF-8 incrementally, and drain
+        # our own queue before waiting for more OS input.
+        raw = os.read(stdin_fd, 4096)
+        if not raw:
+            return "\x1b"
+        stdin_characters.extend(stdin_decoder.decode(raw))
+        if stdin_characters:
+            return stdin_characters.popleft()
     return None
 
 
@@ -1012,8 +1112,10 @@ def validate_runtime_configuration() -> None:
     if args.mode in {"audio", "both"}:
         streaming_engine = resolve_streaming_engine()
         audio_backend = resolve_audio_io_backend()
-        if streaming_engine == "ring" and audio_backend not in {"apple-raw", "apple-vpio"}:
-            problems.append("ring streaming requires --audio-io apple-vpio or --audio-io apple-raw")
+        if streaming_engine == "ring" and audio_backend not in {"sounddevice", "apple-raw", "apple-vpio"}:
+            problems.append("ring streaming requires --audio-io sounddevice, apple-vpio, or apple-raw")
+        if args.input_device is not None and audio_backend != "sounddevice":
+            problems.append("--input-device requires --audio-io sounddevice; Apple capture uses the system default input")
 
     if args.partial_stt_backend == "apple-speech":
         if not args.apple_speech_command:
@@ -1040,6 +1142,12 @@ def validate_runtime_configuration() -> None:
         problems.append("--finalization-hold-ms must be >= 0")
     if args.mt_queue_size < 1 or args.audio_queue_size < 1 or args.tts_queue_size < 1:
         problems.append("queue sizes must be >= 1")
+    if args.inference_queue_size < 1 or args.startup_timeout <= 0 or args.inference_timeout <= 0:
+        problems.append("inference queue size and worker timeouts must be positive")
+    if args.capture_queue_ms < FRAME_MS:
+        problems.append(f"--capture-queue-ms must be >= {FRAME_MS}")
+    if not np.isfinite(args.ring_buffer_seconds) or args.ring_buffer_seconds <= 0:
+        problems.append("--ring-buffer-seconds must be positive and finite")
     if args.force_asr_language:
         forced_backends = {"mlx-vlm-gemma", "mlx-whisper", "whisper-cli", "faster-whisper", "whispercpp-coreml", "apple-speech"}
         selected = {
@@ -1079,6 +1187,9 @@ def list_audio_devices() -> None:
         return
     ensure_audio_runtime()
     devices = sd.query_devices()
+    if len(devices) == 0:
+        eprint("No audio devices were reported by SoundDevice in this session.")
+        return
     default_input, default_output = sd.default.device
     for idx, dev in enumerate(devices):
         marks = []
@@ -1123,8 +1234,6 @@ def looks_like_real_text(text: str) -> bool:
     words = _WORD_RE.findall(text)
     if len(words) < args.min_text_words:
         return False
-    if len(words) <= 2 and len(text) <= 6:
-        return False
     return True
 
 
@@ -1155,7 +1264,7 @@ def should_send_to_asr(audio_i16: np.ndarray, *, partial: bool) -> bool:
     min_duration = args.partial_min_asr_seconds if partial else args.final_min_asr_seconds
     if anti_repeat_enabled() and duration < min_duration:
         return False
-    peak = int(np.max(np.abs(audio_i16))) if audio_i16.size else 0
+    peak = int(np.max(np.abs(audio_i16.astype(np.int32)))) if audio_i16.size else 0
     if anti_repeat_enabled() and peak < args.min_asr_peak:
         return False
     db = rms_dbfs_i16(audio_i16)
@@ -1386,9 +1495,9 @@ def has_model_thinking_artifact(text: str) -> bool:
     return any(marker in folded for marker in THINKING_LEAK_MARKERS)
 
 
-def strip_model_thinking(text: str) -> str:
+def strip_model_thinking(text: str, *, final: bool = True) -> str:
     """Remove model reasoning wrappers before any generated text can reach UI/logs."""
-    text = normalize_text(text)
+    text = normalize_text(clean_model_output(text, final=final))
     if not text:
         return ""
 
@@ -1436,12 +1545,11 @@ def sanitize_asr_text(text: str, *, final: bool) -> str:
         if not text or is_mostly_known_hallucination(text):
             return ""
     if anti_repeat_enabled():
-        text = collapse_repeated_phrases(text, max_ngram=5 if final else 3)
-        if final:
-            text = collapse_overlapping_transcript_repetitions(text)
         text = remove_known_hallucinations(text)
-        if is_repetitive_text(text):
-            return ""
+        if is_repetitive_text(text) and args.debug:
+            # Decoder-loop suspicion is quality evidence, not permission to
+            # delete emphasis, corrections, numbers, or whole similar clauses.
+            log_debug("ASR repetition detected; preserving decoded words for quality review")
     if not looks_like_real_text(text):
         return ""
     return text
@@ -1683,28 +1791,46 @@ def final_dedupe_words(text: str) -> list[str]:
 
 
 def final_transcripts_are_near_duplicates(left: str, right: str) -> bool:
+    """Match word-for-word repeats, preserving corrections and negation.
+
+    Text equality alone never proves duplicate audio; the coordinator must also
+    verify that the two final requests cover the same source interval.
+    """
     left_words = final_dedupe_words(left)
     right_words = final_dedupe_words(right)
-    if not left_words or not right_words:
+    return bool(left_words and left_words == right_words)
+
+
+def final_transcript_audio_span(result: AsrResult) -> tuple[str, str, int, int] | None:
+    """Extract a validated interval in one capture session's source clock."""
+    request = result.diagnostics.get("request", {})
+    if not isinstance(request, dict) or request.get("capture_gap") is not False:
+        return None
+    session = request.get("session_id")
+    language = request.get("source_language")
+    if not isinstance(session, str) or not session or not isinstance(language, str) or not language:
+        return None
+    if result.session_id and result.session_id != session:
+        return None
+    values = [request.get(name) for name in
+              ("timestamp_start_ns", "timestamp_end_ns", "samples", "sample_rate", "channels")]
+    if any(not isinstance(value, int) or isinstance(value, bool) for value in values):
+        return None
+    start, end, samples, rate, channels = values
+    if start < 0 or end <= start or samples <= 0 or rate != SAMPLE_RATE or channels != 1:
+        return None
+    if abs((end - start) - samples * 1_000_000_000 // rate) > 2 * 1_000_000_000 // rate:
+        return None
+    return session, language, start, end
+
+
+def final_transcript_audio_spans_overlap(left: tuple | None, right: tuple | None) -> bool:
+    """Require substantial, proven source overlap before suppressing a repeat."""
+    if left is None or right is None or left[:2] != right[:2]:
         return False
-    if left_words == right_words:
-        return True
-
-    min_unique_words = max(1, min(len(set(left_words)), len(set(right_words))))
-    if min_unique_words < 4:
-        return False
-
-    left_text = " ".join(left_words)
-    right_text = " ".join(right_words)
-    if left_text in right_text or right_text in left_text:
-        return True
-
-    left_set = set(left_words)
-    right_set = set(right_words)
-    contained_ratio = len(left_set & right_set) / min_unique_words
-    sequence_ratio = word_sequence_similarity(left_words, right_words)
-    threshold = max(0.0, min(1.0, float(args.final_dedupe_contained_ratio)))
-    return max(contained_ratio, sequence_ratio) >= threshold
+    overlap = min(left[3], right[3]) - max(left[2], right[2])
+    shorter = min(left[3] - left[2], right[3] - right[2])
+    return overlap > 0 and overlap * 5 >= shorter * 4
 
 
 def common_prefix_text(previous: str, current: str) -> str:
@@ -1766,6 +1892,19 @@ def merge_partial_transcript(previous: str, current: str) -> str:
     if len(cur_words) <= 10 and len(prev_words) >= 3:
         return normalize_text(f"{previous} {current}")
     return current
+
+
+def merge_partial_transcript_with_provenance(previous: str, current: str,
+                                            previous_span: tuple | None, current_span: tuple | None) -> str:
+    """Replace revisions of a growing window; merge only shifted windows.
+
+    An ASR hypothesis for the same source start is a new reading of the whole
+    window, including corrected words. Appending it to the older hypothesis
+    would turn a correction such as 'five' → 'six' into two spoken requests.
+    """
+    if previous_span is not None and current_span is not None and previous_span[:3] == current_span[:3]:
+        return normalize_text(current if current_span[3] >= previous_span[3] else previous)
+    return merge_partial_transcript(previous, current)
 
 
 def word_count(text: str) -> int:
@@ -1879,9 +2018,18 @@ def torch_mps_available() -> bool:
 def resolve_audio_io_backend() -> str:
     if args.audio_io != "auto":
         return args.audio_io
+    if args.input_device is not None:
+        return "sounddevice"
     if is_apple_silicon() and Path(__file__).with_name("apple_vpio_bridge").exists():
         return "apple-vpio"
     return "sounddevice"
+
+
+def sounddevice_input_device() -> str | int | None:
+    device = args.input_device
+    if isinstance(device, str) and re.fullmatch(r"-?\d+", device.strip()):
+        return int(device)
+    return device
 
 
 def resolve_streaming_engine() -> str:
@@ -1913,13 +2061,32 @@ def is_apple_silicon() -> bool:
     return is_macos() and os.uname().machine == "arm64"
 
 
+def prefer_project_model(model_ref: str) -> str:
+    """Use the restored local copy of a selected MLX model when it is present."""
+    model_ref = str(model_ref).strip()
+    direct = Path(model_ref).expanduser()
+    if direct.exists():
+        return str(direct.resolve())
+    if model_ref.startswith("mlx-community/"):
+        local = Path(__file__).resolve().parent / "models" / model_ref.rsplit("/", 1)[-1]
+        if local.is_dir():
+            return str(local)
+    return model_ref
+
+
 def load_pretrained_local_first(loader, model_id: str):
+    model_ref = prefer_project_model(model_id)
+    allow_download = os.environ.get("HF_HUB_OFFLINE", "1").strip().lower() in {"0", "false", "no"}
     try:
-        with silent_external_output():
-            return loader.from_pretrained(model_id, local_files_only=True)
-    except Exception:
-        with silent_external_output():
-            return loader.from_pretrained(model_id)
+        return loader.from_pretrained(model_ref, local_files_only=not allow_download)
+    except (OSError, ValueError) as exc:
+        if allow_download:
+            raise
+        raise RuntimeError(
+            f"Cannot load local model {model_ref!r}: {exc}. "
+            "Prepare its assets with scripts/prepare_models.py --download, "
+            "or explicitly allow Hub access with HF_HUB_OFFLINE=0."
+        ) from exc
 
 
 def ensure_mlx_whisper_loaded():
@@ -2841,6 +3008,10 @@ def _write_dashboard_row(row: int, left: str, divider: str, right: str, half: in
 
 
 def render_dashboard() -> None:
+    if args.ui == "headless":
+        if headless_transport is not None:
+            headless_transport.publish(web_state_snapshot())
+        return
     if not ui_initialized:
         return
     size = shutil.get_terminal_size((120, 20))
@@ -2848,7 +3019,7 @@ def render_dashboard() -> None:
     rows = max(12, size.lines)
     divider = " │ "
     half = max(20, (cols - len(divider)) // 2)
-    body_lines = max(4, rows - 6)
+    body_lines = max(4, rows - 9)
     left_lines = panel_lines("left", half, body_lines)
     right_width = max(20, cols - half - len(divider))
     right_lines = panel_lines("right", right_width, body_lines)
@@ -2867,6 +3038,11 @@ def render_dashboard() -> None:
     row += 1
     input_line = scroll_visible(f"⌨️ {ui_state['input']}", right_width)
     _write_dashboard_row(row, "", divider, input_line, half, cols)
+
+    for stage in ("capture", "asr", "translation"):
+        row += 1
+        value = ui_state.get("stages", {}).get(stage, "not started")
+        sys.stdout.write(f"\x1b[{row};1H\x1b[2K{pad_visible(f'{stage.upper()}: {value}', cols)}")
 
     row += 1
     sys.stdout.write(f"\x1b[{row};1H\x1b[2K{pad_visible(ui_state['status'], cols)}")
@@ -2892,7 +3068,7 @@ def ui_commit_if_ready(side: str, entry_id: int) -> None:
     if not entry:
         return
     if entry.get("src_final") and entry.get("dst_final"):
-        ui_state[done_key].append({"src": entry.get("src", ""), "dst": entry.get("dst", "")})
+        ui_state[done_key].append({"entry_id": entry_id, "src": entry.get("src", ""), "dst": entry.get("dst", "")})
         ui_state[active_key].pop(entry_id, None)
         ui_state[order_key] = [x for x in ui_state[order_key] if x != entry_id]
 
@@ -2980,6 +3156,13 @@ def ui_remove_panel_entry(side: str, entry_id: int) -> None:
 def ui_update(**kwargs) -> None:
     with ui_lock:
         ui_state.update({k: v for k, v in kwargs.items() if v is not None})
+        render_dashboard()
+
+
+def update_stage_status(stage: str, state: str, detail: str = "") -> None:
+    """Persistent stage health, separate from transient progress messages."""
+    with ui_lock:
+        ui_state.setdefault("stages", {})[stage] = f"{state} | {detail}" if detail else state
         render_dashboard()
 
 
@@ -3257,30 +3440,21 @@ def cleanup_audio_result_payload(result: AsrResult | None) -> None:
 
 
 def drop_one_partial_asr_result(q: Queue, label: str) -> bool:
-    kept = []
-    dropped = False
-    try:
-        while True:
-            item = q.get_nowait()
-            if isinstance(item, AsrResult) and item.partial and not dropped:
-                cleanup_audio_result_payload(item)
-                dropped = True
-                if args.debug:
-                    log_debug(f"dropped stale partial {label} result to preserve final ASR")
-            else:
-                kept.append(item)
-            q.task_done()
-    except Empty:
-        pass
-
-    for item in kept:
-        while not shutdown_event.is_set():
-            try:
-                q.put_nowait(item)
+    dropped = None
+    with q.mutex:
+        for index, item in enumerate(q.queue):
+            if isinstance(item, AsrResult) and item.partial:
+                dropped = item
+                del q.queue[index]
+                q.unfinished_tasks -= 1
+                if q.unfinished_tasks == 0:
+                    q.all_tasks_done.notify_all()
+                q.not_full.notify()
                 break
-            except Full:
-                time.sleep(0.001)
-    return dropped
+    if dropped is not None:
+        cleanup_audio_result_payload(dropped)
+        return True
+    return False
 
 
 def queue_put_asr_result(q: Queue, result: AsrResult, label: str) -> bool:
@@ -3483,8 +3657,6 @@ def resolve_stt_backend() -> str:
     if args.stt_backend != "auto":
         return args.stt_backend
     if is_apple_silicon():
-        if MLX_VLM_INSTALLED:
-            return "mlx-vlm-gemma"
         if MLX_WHISPER_INSTALLED or have("mlx_whisper") or have("mlx-whisper"):
             return "mlx-whisper"
         if is_macos() and have("dictate-stt"):
@@ -3534,23 +3706,23 @@ def extract_whisper_cli_text(raw_output: str) -> str:
 
 
 def resolve_mlx_whisper_model_ref() -> str:
-    model = args.whisper_model.strip()
-    candidate = Path(model).expanduser()
-    if candidate.exists():
-        return str(candidate)
-    if "/" in model or model.startswith("mlx-community:"):
-        return model.replace("mlx-community:", "mlx-community/")
-    return f"mlx-community/whisper-{model}"
+    return resolve_mlx_whisper_model_ref_for(args.whisper_model)
 
 
 def resolve_mlx_whisper_model_ref_for(model_name: str) -> str:
-    model = (model_name or args.whisper_model).strip()
-    candidate = Path(model).expanduser()
-    if candidate.exists():
-        return str(candidate)
-    if "/" in model or model.startswith("mlx-community:"):
-        return model.replace("mlx-community:", "mlx-community/")
-    return f"mlx-community/whisper-{model}"
+    return resolve_mlx_whisper_reference(model_name or args.whisper_model,
+                                         Path(__file__).resolve().parent / "models")
+
+
+def prepare_mlx_whisper_runtime_reference(model_name: str) -> str:
+    model_ref = resolve_mlx_whisper_model_ref_for(model_name)
+    root = Path(__file__).resolve().parent
+    if model_ref == LARGE_V3_REPOSITORY or Path(model_ref).name in {"whisper-large-v3", "whisper-large-v3-mlx"}:
+        command = [sys.executable, str(root / "scripts/prepare_models.py"), "--download", "--model", "whisper"]
+    else:
+        command = ["env", "HF_HUB_OFFLINE=0", sys.executable, "-m", "huggingface_hub.cli.hf", "download", model_ref]
+    offline = os.environ.get("HF_HUB_OFFLINE", "1").strip().lower() not in {"0", "false", "no"}
+    return require_cached_mlx_whisper(model_ref, offline=offline, preparation_command=shlex.join(command))
 
 
 def effective_lane_backend(partial: bool) -> str:
@@ -3575,7 +3747,7 @@ def validate_asr_model_language(model_name: str, backend: str) -> None:
     if is_english_only_whisper_model_name(model_name):
         raise RuntimeError(
             f"{backend} model {model_name!r} is English-only, but --source-language is {source_language_code()}. "
-            "Use a multilingual Whisper model such as large-v3-turbo, medium, small, or pass --allow-english-asr-model knowingly."
+            "Use a multilingual Whisper model such as large-v3, medium, small, or pass --allow-english-asr-model knowingly."
         )
 
 
@@ -3596,20 +3768,18 @@ def temporarily_set_attr(obj, name: str, value):
 
 
 def default_whisper_model_for_backend(backend: str) -> str:
+    if backend == "mlx-whisper":
+        return resolve_mlx_whisper_model_ref_for(args.whisper_model)
     if USER_SET_WHISPER_MODEL:
-        return args.whisper_model
-    if backend == "mlx-whisper" and is_apple_silicon():
-        return "large-v3-turbo"
+        return prefer_project_model(args.whisper_model)
     if args.profile == "accurate":
-        return "large-v3-turbo"
+        return "large-v3"
     return args.whisper_model
 
 
 def resolve_translation_backend() -> str:
     if args.translation_backend != "auto":
         return args.translation_backend
-    if args.stt_backend == "mlx-vlm-gemma" and MLX_VLM_INSTALLED:
-        return "mlx-vlm-gemma"
     if is_apple_silicon() and MLX_LM_INSTALLED:
         return "mlx-lm"
     return "nllb"
@@ -3617,11 +3787,11 @@ def resolve_translation_backend() -> str:
 
 def default_translation_model_for_backend(backend: str) -> str:
     if USER_SET_TRANSLATION_MODEL:
-        return args.translation_model
+        return prefer_project_model(args.translation_model)
     if backend == "mlx-vlm-gemma":
-        return args.mlx_vlm_model or DEFAULT_MLX_VLM_AUDIO_MODEL
+        return prefer_project_model(args.mlx_vlm_model or DEFAULT_MLX_VLM_AUDIO_MODEL)
     if backend == "mlx-lm":
-        return DEFAULT_MLX_TRANSLATION_MODEL
+        return prefer_project_model(DEFAULT_MLX_TRANSLATION_MODEL)
     return DEFAULT_NLLB_TRANSLATION_MODEL
 
 
@@ -3632,7 +3802,7 @@ def active_translation_backend() -> str:
 
 
 @lru_cache(maxsize=1)
-def available_say_voices() -> list[str]:
+def available_say_voice_records() -> list[tuple[str, str]]:
     if not is_macos() or not have("say"):
         return []
     try:
@@ -3640,29 +3810,41 @@ def available_say_voices() -> list[str]:
     except Exception:
         return []
 
-    voices: list[str] = []
+    voices: list[tuple[str, str]] = []
     for line in proc.stdout.splitlines():
-        name = line.strip().split(maxsplit=1)[0]
-        if name:
-            voices.append(name)
+        # Voice names can contain spaces and parentheses. The locale is the
+        # final field before the sample phrase, not the second word in a name.
+        match = re.match(r"^\s*(.+?)\s+([a-z]{2,3}[_-][A-Za-z0-9_-]+)\s+#", line)
+        if match:
+            voices.append((match.group(1).strip(), match.group(2).replace("-", "_")))
     return voices
+
+
+def available_say_voices() -> list[str]:
+    return [name for name, _locale in available_say_voice_records()]
 
 
 def pick_say_voice(lang_hint: str = "") -> str:
     code = active_tts_lang_code(lang_hint or source_language_code())
     spec = language_spec(code)
-    voices = available_say_voices()
-    requested = args.say_voice.strip() or spec.say_voice
-    if not voices:
+    records = available_say_voice_records()
+    voices = [name for name, _locale in records]
+    requested = args.say_voice.strip()
+    if requested:
+        if records and requested not in voices:
+            raise RuntimeError(f"Requested macOS voice {requested!r} is not installed")
         return requested
-    if requested in voices:
-        return requested
-    if spec.say_voice and spec.say_voice in voices:
+    wanted_locale = spec.apple_locale.replace("-", "_").lower()
+    matching = [(name, locale) for name, locale in records
+                if locale.split("_", 1)[0].lower() == code.lower()]
+    if spec.say_voice and any(name == spec.say_voice for name, _locale in matching):
         return spec.say_voice
-    for preferred in (spec.say_voice, "Yelda", "Cem", "Samantha"):
-        if preferred and preferred in voices:
-            return preferred
-    return voices[0]
+    for name, locale in matching:
+        if locale.lower() == wanted_locale:
+            return name
+    if matching:
+        return matching[0][0]
+    raise RuntimeError(f"No installed macOS voice matches {spec.name} ({code}); install a matching voice or choose another TTS engine")
 
 
 def resolve_stt_command(preferred: str, alternates: tuple[str, ...] = ()) -> str:
@@ -3919,6 +4101,8 @@ def transcribe_audio_mlx_vlm_gemma(prepared_audio: np.ndarray, *, partial: bool 
                         max_tokens=max(1, int(args.mlx_vlm_max_tokens)),
                     )
     text = clean_mlx_vlm_transcript_output(mlx_vlm_result_text(result), prompt, partial=partial)
+    last_decoder_quality.clear()
+    last_decoder_quality.update({"raw_text": mlx_vlm_result_text(result), "metrics_available": False})
     return text if looks_like_real_text(text) else ""
 
 
@@ -3969,6 +4153,11 @@ def transcribe_audio_mlx_whisper(prepared_audio: np.ndarray, model_name: str | N
             with silent_external_output():
                 result = mlx_module.transcribe(prepared_audio, **decode_kwargs)
         text = normalize_text(str(result.get("text", "")))
+        last_decoder_quality.clear()
+        last_decoder_quality.update(summarize_whisper_result(result))
+        last_decoder_quality["requested_beam"] = requested_beam
+        last_decoder_quality["effective_beam"] = requested_beam if "beam_size" in decode_kwargs else 1
+        last_decoder_quality["beam_search_available"] = mlx_whisper_beam_available
         return text if looks_like_real_text(text) else ""
 
     cmd = resolve_stt_command("mlx_whisper", ("mlx-whisper",))
@@ -4130,7 +4319,7 @@ def init_parent_routing_runtime() -> None:
 
 def init_translation_runtime_only() -> None:
     global tokenizer, translator, use_mps, ID_ENG, ID_TUR, ID_BY_LANG_CODE
-    global mlx_translation_model, mlx_translation_tokenizer, detected_translation_backend
+    global mlx_translation_model, mlx_translation_tokenizer, detected_translation_backend, mlx_translation_stop_ids
 
     detected_translation_backend = resolve_translation_backend()
     args.translation_model = default_translation_model_for_backend(detected_translation_backend)
@@ -4145,30 +4334,23 @@ def init_translation_runtime_only() -> None:
     if translation_ready:
         return
 
-    eprint("🔥 Loading translation model...")
+    eprint(f"🔥 Loading translation model ({detected_translation_backend}): {args.translation_model}")
     if detected_translation_backend == "mlx-vlm-gemma":
         try:
             args.translation_model = default_translation_model_for_backend(detected_translation_backend)
             init_mlx_vlm_gemma_runtime(args.translation_model)
             set_placeholder_language_ids()
         except Exception as exc:
-            if args.translation_backend != "auto":
-                raise RuntimeError("mlx-vlm-gemma translation backend is unavailable in this session.") from exc
-            eprint(f"⚠️ mlx-vlm-gemma unavailable here; falling back to mlx-lm/NLLB ({exc})")
-            detected_translation_backend = "mlx-lm" if MLX_LM_INSTALLED else "nllb"
-            args.translation_model = default_translation_model_for_backend(detected_translation_backend)
+            raise RuntimeError(f"Gemma translation failed for {args.translation_model}: {exc}") from exc
 
     if detected_translation_backend == "mlx-lm":
         try:
             ensure_mlx_lm_loaded()
             mlx_translation_model, mlx_translation_tokenizer = mlx_lm_load(args.translation_model)
+            mlx_translation_stop_ids = configure_translation_stop_tokens(mlx_translation_tokenizer, args.translation_model)
             set_placeholder_language_ids()
         except Exception as exc:
-            if args.translation_backend != "auto":
-                raise RuntimeError("mlx-lm is installed but unavailable in this session. Use --translation-backend nllb if Metal is not accessible.") from exc
-            eprint(f"⚠️ mlx-lm unavailable here; falling back to NLLB ({exc})")
-            detected_translation_backend = "nllb"
-            args.translation_model = default_translation_model_for_backend(detected_translation_backend)
+            raise RuntimeError(f"MLX translation failed for {args.translation_model}: {exc}") from exc
 
     if detected_translation_backend == "nllb":
         if torch is None or AutoTokenizer is None or AutoModelForSeq2SeqLM is None:
@@ -4228,6 +4410,10 @@ def init_stt_runtime_only() -> None:
     elif detected_stt_backend == "mlx-whisper":
         if not MLX_WHISPER_INSTALLED:
             _ = resolve_stt_command("mlx_whisper", ("mlx-whisper",))
+        args.whisper_model = prepare_mlx_whisper_runtime_reference(args.whisper_model)
+        for partial, attribute in ((True, "partial_whisper_model"), (False, "final_whisper_model")):
+            if effective_lane_backend(partial) == "mlx-whisper" and getattr(args, attribute):
+                setattr(args, attribute, prepare_mlx_whisper_runtime_reference(getattr(args, attribute)))
         model_ref = resolve_mlx_whisper_model_ref()
         eprint(f"🔥 Using mlx-whisper ({model_ref}) on {detected_stt_device}...")
         if args.partial_whisper_model or args.final_whisper_model or args.partial_stt_backend != "same" or args.final_stt_backend != "same":
@@ -4250,15 +4436,8 @@ def init_stt_runtime_only() -> None:
         log_verbose(f"Apple-native MLX STT unavailable; fell back to {detected_stt_backend} on {detected_stt_device}.")
 
 
-def warmup_stt_runtime_only(report: bool = True) -> None:
+def warmup_stt_runtime_only(report: bool = True, *, strict: bool = False) -> None:
     if not args.warmup or args.mode not in {"audio", "both"}:
-        return
-    if (
-        detected_stt_backend == "mlx-vlm-gemma"
-        and resolve_streaming_engine() == "ring"
-        and threading.current_thread() is threading.main_thread()
-    ):
-        log_verbose("deferring MLX-VLM Gemma warmup to the ring ASR worker thread")
         return
     try:
         silence = np.zeros(SAMPLE_RATE, dtype=np.float32)
@@ -4284,6 +4463,8 @@ def warmup_stt_runtime_only(report: bool = True) -> None:
                 )[0]
             )
     except Exception as exc:
+        if strict:
+            raise RuntimeError(f"ASR initialization/warmup failed: {exc}") from exc
         if report:
             eprint(f"⚠️ ASR warmup skipped: {exc}")
 
@@ -4300,7 +4481,7 @@ def warmup_vad_runtime_only(report: bool = True) -> None:
             eprint(f"⚠️ Silero VAD warmup skipped: {exc}")
 
 
-def warmup_translation_runtime_only(report: bool = True) -> None:
+def warmup_translation_runtime_only(report: bool = True, *, strict: bool = False) -> None:
     if not args.warmup:
         return
     try:
@@ -4318,6 +4499,8 @@ def warmup_translation_runtime_only(report: bool = True) -> None:
                 max(1, args.mt_beams),
             )
     except Exception as exc:
+        if strict:
+            raise RuntimeError(f"Translation initialization/warmup failed: {exc}") from exc
         if report:
             eprint(f"⚠️ Translation warmup skipped: {exc}")
 
@@ -4385,16 +4568,16 @@ def mlx_translation_prompt(text: str, src_lang: str, forced_bos_id: int) -> str:
         user_prompt = f"{rendered}\n\n{default_prompt}"
     else:
         user_prompt = default_prompt
-    messages = [
-        {
-            "role": "system",
-            "content": "You are a strict real-time translator. Output only the requested target-language translation with no commentary, no quotes, and no extra notes.",
-        },
-        {
-            "role": "user",
-            "content": user_prompt,
-        },
-    ]
+    # TranslateGemma carries direction in structured content and accepts no system
+    # role. Generic instruct models keep the already-rendered legacy prompt,
+    # including custom --mt-prompt handling, without any text normalization here.
+    messages = build_translation_messages(
+        text,
+        src_lang,
+        target_name,
+        default_translation_model_for_backend("mlx-lm"),
+        generic_user_prompt=user_prompt,
+    )
     try:
         return mlx_translation_tokenizer.apply_chat_template(
             messages,
@@ -4479,6 +4662,12 @@ def iter_translate_chunk_mlx_lm(chunk: str, src_lang: str, forced_bos_id: int, n
     del num_beams  # MLX-LM streaming generation does not expose beam search here.
     for response in mlx_lm_stream_generate(mlx_translation_model, mlx_translation_tokenizer, prompt, max_tokens=256):
         piece = getattr(response, "text", "")
+        if getattr(response, "token", None) in mlx_translation_stop_ids:
+            # MLX-LM's final stop response can flush buffered answer characters.
+            # Registered EOS itself was never added to the detokenizer.
+            if getattr(response, "finish_reason", None) == "stop" and piece:
+                yield piece  # Preserve buffered leading whitespace; sanitize the accumulated answer.
+            break
         if piece:
             yield piece
 
@@ -4570,18 +4759,27 @@ def tts_kokoro(text: str, wav_path: str, lang_hint: str) -> bool:
 def tts_say(text: str, wav_path: str, lang_hint: str) -> bool:
     if not is_macos() or not have("say"):
         return False
+    voice = pick_say_voice(lang_hint)
     with TemporaryDirectory(prefix="tts-transcribe-say-") as tmpdir:
         aiff = os.path.join(tmpdir, "out.aiff")
+        source = Path(tmpdir) / "speech.txt"
+        source.write_text(text, encoding="utf-8")
         try:
-            subprocess.run(["say", "-v", pick_say_voice(lang_hint), "-o", aiff, text], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            subprocess.run(["afconvert", "-f", "WAVE", "-d", "LEI16@22050", aiff, wav_path], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["say", "-v", voice, "-o", aiff, "-f", str(source)], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=120)
+            subprocess.run(["afconvert", "-f", "WAVE", "-d", "LEI16@22050", aiff, wav_path], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=30)
+            with wave.open(wav_path, "rb") as rendered:
+                if rendered.getnframes() <= 0:
+                    raise RuntimeError(f"macOS voice {voice!r} produced no audio; check the installed voice and macOS speech service")
             return True
-        except Exception:
-            return False
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(f"macOS speech synthesis timed out for {voice!r}") from exc
+        except subprocess.CalledProcessError as exc:
+            detail = normalize_text(exc.stderr or "")[:300]
+            raise RuntimeError(f"macOS speech synthesis failed for {voice!r}" + (f": {detail}" if detail else "")) from exc
 
 
-def tts_piper(text: str, wav_path: str, _lang_hint: str) -> bool:
-    if not have("piper") or not os.path.exists(VOICE_TR):
+def tts_piper(text: str, wav_path: str, lang_hint: str) -> bool:
+    if active_tts_lang_code(lang_hint) != "TR" or not have("piper") or not os.path.exists(VOICE_TR):
         return False
     try:
         subprocess.run(["piper", "-m", VOICE_TR, "-f", wav_path], input=text, text=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -4641,9 +4839,9 @@ def play_wav(path: str) -> None:
         audio_bridge.play_wav(path)
         return
     if is_macos() and have("afplay"):
-        subprocess.run(["afplay", path], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["afplay", path], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     elif have("ffplay"):
-        subprocess.run(["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", path], check=False)
+        subprocess.run(["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", path], check=True)
     else:
         raise RuntimeError("No audio playback command found (need afplay or ffplay)")
 
@@ -4666,22 +4864,29 @@ def tts_best_available(text: str, wav_out: str, lang_hint: str = "TR") -> str:
     elif active_tts_lang_code(lang_hint) == "TR":
         order = [("piper", tts_piper), ("say", tts_say), ("edge", tts_edge), ("kokoro", tts_kokoro)]
     else:
-        order = [("edge", tts_edge), ("say", tts_say), ("kokoro", tts_kokoro), ("piper", tts_piper)]
+        order = [("say", tts_say), ("edge", tts_edge), ("kokoro", tts_kokoro), ("piper", tts_piper)]
 
     chunks = chunk_for_tts(text)
     with TemporaryDirectory(prefix="tts-transcribe-tts-") as tmpdir:
         part_paths: list[str] = []
         chosen_name = None
         chosen_fn = None
+        failures: list[str] = []
         for name, fn in order:
             probe = os.path.join(tmpdir, "probe.wav")
-            if fn(chunks[0], probe, lang_hint):
+            try:
+                succeeded = fn(chunks[0], probe, lang_hint)
+            except Exception as exc:
+                failures.append(f"{name}: {exc}")
+                continue
+            if succeeded:
                 chosen_name = name
                 chosen_fn = fn
                 part_paths.append(probe)
                 break
+            failures.append(f"{name}: unavailable or could not synthesize {active_tts_lang_code(lang_hint)}")
         if chosen_fn is None:
-            raise RuntimeError("No TTS engine succeeded. Install Kokoro, Piper, a macOS voice, or edge-tts.")
+            raise RuntimeError("No TTS engine succeeded. " + "; ".join(failures))
 
         for idx, chunk in enumerate(chunks[1:], start=1):
             chunk_path = os.path.join(tmpdir, f"part_{idx:03d}.wav")
@@ -4804,23 +5009,42 @@ class TimestampedAppleVPIOBridge:
 
 class NativeTimestampRingBuffer:
     def __init__(self, seconds: float, sample_rate: int = SAMPLE_RATE):
-        self.max_samples = max(FRAME_SAMPLES, int(seconds * sample_rate))
-        self.frames: list[tuple[int, np.ndarray]] = []
+        if not np.isfinite(sample_rate) or sample_rate <= 0 or not np.isfinite(seconds) or seconds <= 0:
+            raise ValueError("ring duration and sample rate must be positive and finite")
+        self.sample_rate = sample_rate
+        self.max_samples = max(1, int(seconds * sample_rate))
+        self.frames: deque[tuple[int, np.ndarray]] = deque()
         self.total_samples = 0
         self.lock = threading.Lock()
 
     def write(self, timestamp_ns: int, pcm: np.ndarray) -> None:
         if pcm.size == 0:
             return
+        samples = np.asarray(pcm, dtype=np.int16).reshape(-1).copy()
+        timestamp_ns = int(timestamp_ns)
+        # A large callback still contributes its newest tail instead of evicting
+        # itself entirely. Timestamps describe the retained first sample.
+        if samples.size > self.max_samples:
+            skipped = int(samples.size) - self.max_samples
+            samples = samples[-self.max_samples:].copy()
+            timestamp_ns += skipped * 1_000_000_000 // self.sample_rate
         with self.lock:
-            self.frames.append((int(timestamp_ns), pcm.astype(np.int16, copy=False).copy()))
-            self.total_samples += int(pcm.size)
-            while self.frames and self.total_samples > self.max_samples:
-                _ts, old = self.frames.pop(0)
-                self.total_samples -= int(old.size)
+            self.frames.append((timestamp_ns, samples))
+            self.total_samples += int(samples.size)
+            overflow = self.total_samples - self.max_samples
+            while self.frames and overflow > 0:
+                old_timestamp, old = self.frames.popleft()
+                trim = min(overflow, int(old.size))
+                self.total_samples -= trim
+                overflow -= trim
+                if trim < old.size:
+                    self.frames.appendleft((
+                        old_timestamp + trim * 1_000_000_000 // self.sample_rate,
+                        old[trim:].copy(),
+                    ))
 
     def latest_ms(self, ms: int) -> np.ndarray:
-        need = max(1, int(SAMPLE_RATE * ms / 1000))
+        need = max(1, int(self.sample_rate * ms / 1000))
         chunks: list[np.ndarray] = []
         remaining = need
         with self.lock:
@@ -4887,9 +5111,32 @@ class PriorityAsrScheduler:
         self.latest_partial_seq: dict[int, int] = {}
         self.partial_inflight_utterance: int | None = None
 
-    def submit(self, utterance_id: int, pcm: np.ndarray, partial: bool) -> bool:
+    def submit_with_provenance(self, utterance_id: int, pcm: np.ndarray, partial: bool, provenance: dict) -> bool:
+        return self.submit(utterance_id, pcm, partial, provenance=provenance)
+
+    def submit(self, utterance_id: int, pcm: np.ndarray, partial: bool, provenance: dict | None = None) -> bool:
         if pcm.size == 0:
             return False
+        if asr_stage is not None:
+            with self.lock:
+                if partial and utterance_id in self.final_submitted:
+                    return False
+                if partial and args.partial_queue_latest_only:
+                    snapshot = asr_stage.snapshot
+                    if (snapshot.get("state") == "loading" or snapshot.get("committed_pending", 0)
+                            or snapshot.get("inflight_partial") or snapshot.get("partials_pending", 0)):
+                        # Let one preview finish rather than continually replacing
+                        # its result when inference is slower than the cadence.
+                        return False
+                if not partial:
+                    self.final_submitted.add(utterance_id)
+                    self.cancelled_partials.add(utterance_id)
+            accepted = submit_asr_stage(utterance_id, pcm, partial, provenance=provenance)
+            if not accepted and not partial:
+                with self.lock:
+                    self.final_submitted.discard(utterance_id)
+                    self.cancelled_partials.discard(utterance_id)
+            return accepted
         priority = 10 if partial else 0
         marked_final_pending = False
         with self.lock:
@@ -4938,45 +5185,33 @@ class PriorityAsrScheduler:
         return False
 
     def _drop_queued_partials_for(self, utterance_id: int) -> None:
-        kept = []
-        try:
-            while True:
-                item = self.q.get_nowait()
-                self.q.task_done()
-                if not (item[2] == utterance_id and item[3]):
-                    kept.append(item)
-        except Empty:
-            pass
-        for item in kept:
-            try:
-                self.q.put_nowait(item)
-            except Full:
-                pass
+        self._remove_queued_partials(utterance_id=utterance_id)
 
     def _drop_one_queued_partial(self) -> bool:
-        kept = []
-        dropped = False
-        try:
-            while True:
-                item = self.q.get_nowait()
-                self.q.task_done()
-                if not dropped and item[3]:
-                    dropped = True
-                    if args.debug:
-                        log_debug(f"ring ASR dropped queued speculative partial utterance={item[2]} to preserve final ASR")
-                    continue
-                kept.append(item)
-        except Empty:
-            pass
+        return bool(self._remove_queued_partials(limit=1))
 
-        for item in kept:
-            while not shutdown_event.is_set():
-                try:
-                    self.q.put_nowait(item)
-                    break
-                except Full:
-                    time.sleep(0.001)
-        return dropped
+    def _remove_queued_partials(self, utterance_id: int | None = None, limit: int | None = None) -> int:
+        # Draining and reinserting a live queue lets concurrent producers occupy
+        # its slots and can lose/reorder committed finals. Change only selected
+        # speculative entries while holding the queue's own synchronization lock.
+        with self.q.mutex:
+            candidates = sorted(
+                (item for item in self.q.queue if item[3]
+                 and (utterance_id is None or item[2] == utterance_id)),
+                key=lambda item: item[1],
+            )
+            if limit is not None:
+                candidates = candidates[:limit]
+            removed_sequences = {item[1] for item in candidates}
+            if not removed_sequences:
+                return 0
+            self.q.queue[:] = [item for item in self.q.queue if item[1] not in removed_sequences]
+            heapify(self.q.queue)
+            self.q.unfinished_tasks -= len(removed_sequences)
+            if self.q.unfinished_tasks == 0:
+                self.q.all_tasks_done.notify_all()
+            self.q.not_full.notify_all()
+            return len(removed_sequences)
 
     def _is_stale_partial(self, utterance_id: int, seq: int) -> bool:
         if utterance_id in self.cancelled_partials or utterance_id in self.final_submitted:
@@ -5024,6 +5259,11 @@ class PriorityAsrScheduler:
 
 
 class RingEndpointDetector:
+    # Prefer a pause after the normal 18 s window. A 28 s hard limit leaves
+    # headroom inside Whisper's 30 s context, including onset pre-roll.
+    HARD_WINDOW_SECONDS = 28.0
+    SOFT_BOUNDARY_SILENCE_MS = 240
+
     def __init__(self, ring: NativeTimestampRingBuffer, scheduler: PriorityAsrScheduler):
         self.ring = ring
         self.scheduler = scheduler
@@ -5036,25 +5276,25 @@ class RingEndpointDetector:
         self.utterance_id = 0
         self.active: list[np.ndarray] = []
         self.pre_roll: list[np.ndarray] = []
+        self.pre_roll_timestamps: list[int] = []
+        self.active_timestamps: list[int] = []
+        self.active_samples = 0
+        self.capture_gap = False
         self.silence_ms = 0
         self.speech_ms = 0
         self.total_ms = 0
         self.speech_frames = 0
         self.total_frames = 0
+        self.trailing_silence_frames = 0
         self.last_partial_ms = 0
         self.pending_final = False
-        self.pending_final_started_at = 0.0
+        self.pending_final_started_sample: int | None = None
         self.pause_ewma_ms = float(args.silence_base_ms)
         self.adaptive_silence_ms = int(args.silence_base_ms)
-        self.pending_final = False
-        self.pending_final_started_at = 0.0
 
     def _current_endpoint_threshold(self) -> int:
         # Apply the legacy adaptive/semantic endpointing logic to the ring path.
-        text = current_partial_text
-        stability = current_partial_stability
-        last_change_ms = current_partial_last_change_ms
-        locked_ratio = current_partial_locked_ratio
+        text, stability, last_change_ms, locked_ratio = partial_endpoint_snapshot(self.utterance_id)
         base = compute_adaptive_threshold(self.pause_ewma_ms, self.speech_ms)
         base = semantic_endpoint_threshold(base, text)
         base = transcript_stability_bias(base, stability, last_change_ms)
@@ -5078,54 +5318,99 @@ class RingEndpointDetector:
 
     def on_frame(self, timestamp_ns: int, pcm: np.ndarray) -> None:
         self.ring.write(timestamp_ns, pcm)
-        is_speech, db, prob = self.vad_gate.detect(pcm)
+        # Explicit forced flushes can end on a sub-frame. VAD still receives its
+        # required 20 ms input; ring history and ASR retain only captured samples.
+        vad_pcm = np.pad(pcm, (0, FRAME_SAMPLES - pcm.size)) if pcm.size < FRAME_SAMPLES else pcm
+        is_speech, db, prob = self.vad_gate.detect(vad_pcm)
+        self.last_dbfs = db
         with self.lock:
             self._consume(TimestampedAudioFrame(pcm=pcm, timestamp_ns=timestamp_ns, dbfs=db, is_speech=is_speech, speech_prob=prob))
 
+    def _window_provenance(self, pcm: np.ndarray, frame_count: int) -> dict:
+        times = self.active_timestamps[-frame_count:]
+        frames = self.active[-frame_count:]
+        provenance = {"capture_gap": self.capture_gap, "frame_count": frame_count,
+                      "timestamp_start_ns": times[0] if times else None,
+                      "timestamp_end_ns": times[-1] + int(frames[-1].size) * 1_000_000_000 // SAMPLE_RATE if times and frames else None,
+                      "sample_rate": SAMPLE_RATE, "channels": 1}
+        if times and frames and len(times) == len(frames):
+            duration_ns = provenance["timestamp_end_ns"] - provenance["timestamp_start_ns"]
+            expected_ns = int(pcm.size) * 1_000_000_000 // SAMPLE_RATE
+            provenance["source_span_minus_pcm_ns"] = duration_ns - expected_ns
+            if abs(duration_ns - expected_ns) > 2 * 1_000_000_000 // SAMPLE_RATE:
+                provenance["capture_gap"] = True
+        return provenance
+
+    def _submit_window(self, pcm: np.ndarray, partial: bool, frame_count: int,
+                       *, boundary_reason: str | None = None, forced_speech_boundary: bool = False) -> bool:
+        provenance = self._window_provenance(pcm, frame_count)
+        if not partial:
+            provenance.update(boundary_reason=boundary_reason or "endpoint",
+                              forced_speech_boundary=forced_speech_boundary)
+        method = getattr(self.scheduler, "submit_with_provenance", None)
+        if method is not None:
+            return method(self.utterance_id, pcm, partial, provenance)
+        return self.scheduler.submit(self.utterance_id, pcm, partial=partial)
+
     def _consume(self, frame: TimestampedAudioFrame) -> None:
-        if tts_playing.is_set() and time.time() < playback_guard_until:
+        if capture_paused_for_playback():
             return
         if not self.in_speech:
             self.pre_roll.append(frame.pcm)
+            self.pre_roll_timestamps.append(frame.timestamp_ns)
             if len(self.pre_roll) > pre_roll_max:
                 self.pre_roll = self.pre_roll[-pre_roll_max:]
+                self.pre_roll_timestamps = self.pre_roll_timestamps[-pre_roll_max:]
             if frame.is_speech:
                 self.utterance_id += 1
                 self.in_speech = True
-                reset_current_partial_state()
+                reset_current_partial_state(next_utterance_id=self.utterance_id)
                 trace_update(self.utterance_id, speech_started_at=time.perf_counter())
-                self.active = [*self.pre_roll, frame.pcm]
+                # pre_roll already contains the triggering speech frame.
+                self.active = list(self.pre_roll)
+                self.active_timestamps = list(self.pre_roll_timestamps)
+                self.active_samples = sum(int(pcm.size) for pcm in self.active)
                 self.silence_ms = 0
                 self.speech_ms = FRAME_MS
                 self.total_ms = FRAME_MS
                 self.speech_frames = 1
                 self.total_frames = 1
+                self.trailing_silence_frames = 0
                 self.last_partial_ms = 0
                 self.pause_ewma_ms = float(args.silence_base_ms)
                 self.adaptive_silence_ms = int(args.silence_base_ms)
             return
         self.active.append(frame.pcm)
+        self.active_timestamps.append(frame.timestamp_ns)
+        self.active_samples += int(frame.pcm.size)
         self.total_ms += FRAME_MS
         self.total_frames += 1
         if frame.is_speech:
             self.speech_ms += FRAME_MS
             self.speech_frames += 1
             self.silence_ms = 0
+            self.trailing_silence_frames = 0
             if self.pending_final:
                 self.pending_final = False
-                self.pending_final_started_at = 0.0
+                self.pending_final_started_sample = None
         else:
             self.silence_ms += FRAME_MS
+            self.trailing_silence_frames += 1
             self.pause_ewma_ms = (1.0 - args.adapt_alpha) * self.pause_ewma_ms + args.adapt_alpha * float(self.silence_ms)
         if self.silence_ms == 0 and not self.pending_final and self.total_ms - self.last_partial_ms >= int(args.streaming_asr_chunk_seconds * 1000):
             self.last_partial_ms = self.total_ms
             partial_pcm = self._active_partial_window()
             if partial_pcm.size >= int(0.35 * SAMPLE_RATE):
                 trace_update(self.utterance_id, partial_audio_ready_at=time.perf_counter())
-                if self.scheduler.submit(self.utterance_id, partial_pcm, partial=True):
+                count = min(len(self.active), max(1, int(args.partial_asr_window_seconds * 1000 / FRAME_MS)))
+                if self._submit_window(partial_pcm, True, count):
                     show_inflight_partial_transcript(self.utterance_id)
-        if self.total_ms >= int(MAX_UTTERANCE_SECONDS * 1000):
-            self._finalize_locked(force=True)
+        if self.active_samples >= round(self.HARD_WINDOW_SECONDS * SAMPLE_RATE):
+            self._finalize_locked(force=True, boundary_reason="hard_duration_limit", forced_speech_boundary=True)
+            return
+        if (self.active_samples >= round(MAX_UTTERANCE_SECONDS * SAMPLE_RATE)
+                and self.silence_ms >= self.SOFT_BOUNDARY_SILENCE_MS):
+            self._finalize_locked(boundary_reason="soft_duration_silence", keep_quiet_preroll=True)
             return
         endpoint_threshold = self._current_endpoint_threshold() if self.silence_ms else self.adaptive_silence_ms
         if self.silence_ms >= endpoint_threshold:
@@ -5133,74 +5418,404 @@ class RingEndpointDetector:
                 self._finalize_locked(force=False)
             elif not self.pending_final:
                 self.pending_final = True
-                self.pending_final_started_at = time.perf_counter()
-            elif (time.perf_counter() - self.pending_final_started_at) * 1000.0 >= args.finalization_hold_ms:
+                self.pending_final_started_sample = self.active_samples
+            elif ((self.active_samples - self.pending_final_started_sample) * 1000
+                  >= args.finalization_hold_ms * SAMPLE_RATE):
                 self._finalize_locked(force=False)
 
     def finalize(self, force: bool = False) -> None:
         with self.lock:
-            self._finalize_locked(force=force)
+            self._finalize_locked(force=force, boundary_reason="forced_flush" if force else "endpoint")
 
-    def _finalize_locked(self, force: bool = False) -> None:
+    def _finalize_locked(self, force: bool = False, *, boundary_reason: str = "endpoint",
+                         forced_speech_boundary: bool = False, keep_quiet_preroll: bool = False) -> None:
         if not self.in_speech or not self.active:
             self._reset_utterance()
             return
-        speech_ratio = self.speech_frames / max(1, self.total_frames)
-        duration_sec = sum(x.size for x in self.active) / SAMPLE_RATE
-        if force or (duration_sec >= MIN_UTTERANCE_SECONDS and self.speech_frames >= args.min_speech_frames and speech_ratio >= args.min_speech_ratio):
-            pcm = np.concatenate(self.active).astype(np.int16, copy=False)
+        # Endpoint waiting adds silence to the model input, not to the speech
+        # span's quality denominator. Otherwise short valid words disappear
+        # merely because the recognizer waited long enough for their ending.
+        speech_span_frames = max(1, self.total_frames - self.trailing_silence_frames)
+        speech_ratio = self.speech_frames / speech_span_frames
+        duration_sec = self.active_samples / SAMPLE_RATE
+        accepted = force or (duration_sec >= MIN_UTTERANCE_SECONDS
+                             and self.speech_frames >= args.min_speech_frames
+                             and speech_ratio >= args.min_speech_ratio)
+        pcm = np.concatenate(self.active).astype(np.int16, copy=False)
+        if accepted:
             trace_update(self.utterance_id, final_audio_ready_at=time.perf_counter())
             clear_inflight_partial_marker(self.utterance_id)
-            self.scheduler.submit(self.utterance_id, pcm, partial=False)
+            self._submit_window(pcm, False, len(self.active), boundary_reason=boundary_reason,
+                                forced_speech_boundary=forced_speech_boundary)
+        if audio_evidence is not None and (not accepted or forced_speech_boundary):
+            reason = "endpoint_speech_gate" if not accepted else "forced_speech_boundary"
+            metadata = {"session_id": runtime_session_id, "source_language": source_language_code(),
+                        "utterance_id": self.utterance_id, "boundary_reason": boundary_reason,
+                        "forced_speech_boundary": forced_speech_boundary,
+                        "speech_frames": self.speech_frames, "speech_span_frames": speech_span_frames,
+                        "total_frames": self.total_frames, "trailing_silence_frames": self.trailing_silence_frames,
+                        "speech_ratio": speech_ratio, "duration_seconds": duration_sec,
+                        "min_speech_frames": args.min_speech_frames, "min_speech_ratio": args.min_speech_ratio,
+                        **self._window_provenance(pcm, len(self.active))}
+            audio_evidence.save_clip(pcm.astype("<i2", copy=False), metadata, [reason],
+                                     label=f"u{self.utterance_id}-{reason}")
+            audio_evidence.event({"type": reason, **metadata})
+        quiet_count = min(pre_roll_max, self.trailing_silence_frames) if keep_quiet_preroll else 0
+        quiet_frames = self.active[-quiet_count:] if quiet_count else []
+        quiet_times = self.active_timestamps[-quiet_count:] if quiet_count else []
         self._reset_utterance()
+        self.pre_roll = quiet_frames
+        self.pre_roll_timestamps = quiet_times
 
     def _reset_utterance(self) -> None:
         self.in_speech = False
         self.active = []
         self.pre_roll = []
+        self.pre_roll_timestamps = []
+        self.active_timestamps = []
+        self.active_samples = 0
+        self.capture_gap = False
         self.silence_ms = 0
         self.speech_ms = 0
         self.total_ms = 0
         self.speech_frames = 0
         self.total_frames = 0
+        self.trailing_silence_frames = 0
         self.last_partial_ms = 0
         self.pending_final = False
-        self.pending_final_started_at = 0.0
+        self.pending_final_started_sample = None
 
 
 ring_scheduler: PriorityAsrScheduler | None = None
 ring_endpoint: RingEndpointDetector | None = None
 
 
-class RingAppleVPIOFeeder:
-    """Callback adapter so ring mode uses the proven apple_vpio_bridge.swift IO path.
+@dataclass(slots=True)
+class NativePCMFrame:
+    sequence: int
+    timestamp_ns: int
+    pcm: np.ndarray
+    discontinuity: bool = False
+    valid_samples: int = FRAME_SAMPLES
 
-    The Swift bridge emits raw 16 kHz mono int16 PCM frames on stdout and accepts
-    WAV playback payloads on stdin. That path is known to capture/play correctly;
-    this adapter adds monotonic timestamps on the Python side before feeding the
-    ring endpoint.
+
+class RingAudioFeeder:
+    """Bounded single-source ingress for SoundDevice and the native Apple bridge.
+
+    Callbacks only assemble/copy fixed 20 ms mono int16 frames. One worker feeds
+    the endpoint in sequence order; model/VAD work never runs in the callback.
+    SoundDevice ADC time is mapped to the monotonic clock once. Raw Apple PCM
+    has no hardware timestamps, so its sample clock starts at first receipt.
     """
 
-    def __init__(self, endpoint: RingEndpointDetector):
+    def __init__(self, endpoint: RingEndpointDetector, queue_ms: int | None = None, *, clock_ns=None):
         self.endpoint = endpoint
-        self.next_timestamp_ns = time.monotonic_ns()
-        self.lock = threading.Lock()
+        self.max_frames = max(1, int(args.capture_queue_ms if queue_ms is None else queue_ms) // FRAME_MS)
+        self.clock_ns = clock_ns or time.monotonic_ns
+        self.condition = threading.Condition()
+        self.queue: deque[NativePCMFrame | None] = deque()  # None is an ordered forced-final boundary.
+        self.queued_frames = 0
+        self.pending = np.empty(0, dtype=np.int16)
+        self.pending_timestamp_ns = 0
+        self.next_timestamp_ns: int | None = None
+        self.portaudio_clock_offset_ns: int | None = None
+        self.next_sequence = 0
+        self.discontinuity_pending = False
+        self.dropped_samples = 0
+        self.dropped_frames = 0
+        self.status_events = 0
+        self.input_overruns = 0
+        self.callback_errors = 0
+        self.captured_samples = 0
+        self.last_input_at = 0.0
+        self.last_capture_status = ""
+        self.closed = False
+        self.worker_thread: threading.Thread | None = None
 
-    def callback(self, indata, frames: int, _time_info, _status) -> None:
+    def __enter__(self):
+        self.worker_thread = threading.Thread(target=self.worker, name="ring-capture", daemon=True)
+        self.worker_thread.start()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+
+    def _timestamp(self, time_info, samples: int) -> tuple[int, bool]:
+        now_ns = self.clock_ns()
         try:
-            pcm = np.asarray(indata, dtype=np.int16).reshape(-1).copy()
-            if pcm.size == 0:
+            def field_value(name):
+                return float(time_info[name] if isinstance(time_info, dict) else getattr(time_info, name))
+            adc, current = field_value("inputBufferAdcTime"), field_value("currentTime")
+            if not np.isfinite(adc) or not np.isfinite(current) or adc <= 0 or current < adc:
+                raise ValueError("no valid ADC clock")
+            if self.portaudio_clock_offset_ns is None:
+                self.portaudio_clock_offset_ns = now_ns - round(current * 1_000_000_000)
+            timestamp_ns = self.portaudio_clock_offset_ns + round(adc * 1_000_000_000)
+            gap = False
+            if self.next_timestamp_ns is not None:
+                # Sub-frame clock jitter must not fragment speech. A reported
+                # device overflow always creates a boundary; an unreported ADC
+                # jump of over half a frame also starts a separate utterance.
+                if abs(timestamp_ns - self.next_timestamp_ns) > FRAME_MS * 1_000_000 // 2:
+                    gap = True
+                    self.status_events += 1
+                    self.last_capture_status = "ADC timestamp gap/reset"
+                    if timestamp_ns < self.next_timestamp_ns:
+                        self.portaudio_clock_offset_ns += self.next_timestamp_ns - timestamp_ns
+                    timestamp_ns = max(timestamp_ns, self.next_timestamp_ns)
+                else:
+                    timestamp_ns = self.next_timestamp_ns
+            return timestamp_ns, gap
+        except (AttributeError, KeyError, TypeError, ValueError, OverflowError):
+            if self.next_timestamp_ns is not None:
+                return self.next_timestamp_ns, False
+            return now_ns - samples * 1_000_000_000 // SAMPLE_RATE, False
+
+    def _enqueue_frame(self, timestamp_ns: int, pcm: np.ndarray, valid_samples: int = FRAME_SAMPLES) -> None:
+        while self.queued_frames >= self.max_frames:
+            for index, old in enumerate(self.queue):
+                if old is not None:
+                    del self.queue[index]
+                    self.queued_frames -= 1
+                    self.dropped_frames += 1
+                    self.dropped_samples += old.valid_samples
+                    # Coalesce boundaries made adjacent by eviction, keeping
+                    # control messages bounded along with the audio frames.
+                    if 0 < index < len(self.queue) and self.queue[index - 1] is None and self.queue[index] is None:
+                        del self.queue[index]
+                    break
+        self.queue.append(NativePCMFrame(
+            self.next_sequence, int(timestamp_ns), pcm.copy(), self.discontinuity_pending, valid_samples,
+        ))
+        self.next_sequence += 1
+        self.discontinuity_pending = False
+        self.queued_frames += 1
+
+    def callback(self, indata, frames: int, time_info, status) -> None:
+        with self.condition:
+            if self.closed or shutdown_event.is_set():
                 return
-            with self.lock:
-                timestamp_ns = self.next_timestamp_ns
-                duration_ns = int((pcm.size / SAMPLE_RATE) * 1_000_000_000)
-                self.next_timestamp_ns = max(time.monotonic_ns(), self.next_timestamp_ns + duration_ns)
-            self.endpoint.on_frame(timestamp_ns, pcm)
-        except Exception as exc:
-            ui_update(status=f"❌ Ring capture callback error: {exc}")
+            try:
+                pcm = np.asarray(indata)
+                if pcm.dtype != np.dtype(np.int16):
+                    raise ValueError(f"capture dtype {pcm.dtype} is not Int16; refusing implicit PCM conversion")
+                if pcm.ndim == 2 and pcm.shape[1] == 1:
+                    pcm = pcm[:, 0]
+                if pcm.ndim != 1 or int(frames) != pcm.size:
+                    raise ValueError("capture requires 16 kHz mono int16 PCM with a matching frame count")
+                source_start_sample = self.captured_samples
+                self.captured_samples += int(pcm.size)
+                self.last_input_at = time.monotonic()
+                if status:
+                    self.status_events += 1
+                    self.input_overruns += int(bool(getattr(status, "input_overflow", False)))
+                    self.last_capture_status = str(status)
+                    self.discontinuity_pending = True
+                if pcm.size == 0:
+                    if status:
+                        self.dropped_samples += int(self.pending.size)
+                        self.pending = np.empty(0, dtype=np.int16)
+                    self.condition.notify()
+                    return
+                timestamp_ns, clock_gap = self._timestamp(time_info, int(pcm.size))
+                if audio_evidence is not None:
+                    if audio_review_mode == "full":
+                        audio_evidence.capture(pcm.astype("<i2", copy=False), start_sample=source_start_sample,
+                                               timestamp_ns=timestamp_ns, discontinuity=bool(self.discontinuity_pending or status or clock_gap))
+                    if status or clock_gap:
+                        audio_evidence.event({"type": "capture_discontinuity", "source_start_sample": source_start_sample,
+                                              "timestamp_ns": timestamp_ns, "input_status": str(status), "clock_gap": clock_gap})
+                self.discontinuity_pending = self.discontinuity_pending or clock_gap
+                if (status or clock_gap) and self.pending.size:
+                    self.dropped_samples += int(self.pending.size)
+                    self.pending = np.empty(0, dtype=np.int16)
+                self.next_timestamp_ns = timestamp_ns + pcm.size * 1_000_000_000 // SAMPLE_RATE
+                offset = 0
+                if self.pending.size:
+                    take = min(FRAME_SAMPLES - int(self.pending.size), int(pcm.size))
+                    combined = np.concatenate((self.pending, pcm[:take]))
+                    offset = take
+                    if combined.size == FRAME_SAMPLES:
+                        self._enqueue_frame(self.pending_timestamp_ns, combined)
+                        self.pending = np.empty(0, dtype=np.int16)
+                    else:
+                        self.pending = combined
+                while offset + FRAME_SAMPLES <= pcm.size:
+                    self._enqueue_frame(timestamp_ns + offset * 1_000_000_000 // SAMPLE_RATE, pcm[offset:offset + FRAME_SAMPLES])
+                    offset += FRAME_SAMPLES
+                if offset < pcm.size:
+                    self.pending = pcm[offset:].copy()
+                    self.pending_timestamp_ns = timestamp_ns + offset * 1_000_000_000 // SAMPLE_RATE
+            except Exception as exc:
+                self.callback_errors += 1
+                self.last_capture_status = str(exc)
+                self.discontinuity_pending = True
+                self.dropped_samples += int(self.pending.size)
+                self.pending = np.empty(0, dtype=np.int16)
+            self.condition.notify()
+
+    def _flush_pending(self) -> None:
+        if self.pending.size:
+            pcm = np.pad(self.pending, (0, FRAME_SAMPLES - self.pending.size))
+            self._enqueue_frame(self.pending_timestamp_ns, pcm, int(self.pending.size))
+            self.pending = np.empty(0, dtype=np.int16)
+
+    def request_finalize(self) -> None:
+        with self.condition:
+            if not self.closed:
+                # A user flush owns all audio captured before this barrier,
+                # including the tail awaiting the next full live callback.
+                self._flush_pending()
+                if not self.queue or self.queue[-1] is not None:
+                    self.queue.append(None)
+                self.condition.notify()
+
+    def close(self) -> None:
+        with self.condition:
+            if not self.closed:
+                self._flush_pending()
+                if not self.queue or self.queue[-1] is not None:
+                    self.queue.append(None)
+                self.closed = True
+                self.condition.notify_all()
+        if self.worker_thread is not None and self.worker_thread is not threading.current_thread():
+            self.worker_thread.join(timeout=2.0)
+
+    def worker(self) -> None:
+        expected_sequence = 0
+        last_stats = (0, 0, 0, 0)
+        needs_boundary = False
+        while not shutdown_event.is_set():
+            with self.condition:
+                if not self.queue and not self.closed:
+                    self.condition.wait(timeout=0.1)
+                stats = (self.dropped_frames, self.dropped_samples, self.status_events, self.callback_errors)
+                detail, overruns = self.last_capture_status, self.input_overruns
+                has_item = bool(self.queue)
+                done = self.closed and not has_item
+                item = self.queue.popleft() if self.queue else None
+                if item is not None:
+                    self.queued_frames -= 1
+            if stats != last_stats:
+                ui_update(status=f"⚠️ Capture discontinuity | dropped={stats[0]} frames/{stats[1]} samples | input overruns={overruns} | status events={stats[2]} | callback errors={stats[3]} | {detail}")
+                last_stats = stats
+            if done:
+                return
+            try:
+                if item is not None:
+                    if needs_boundary or item.discontinuity or item.sequence != expected_sequence:
+                        if hasattr(self.endpoint, "capture_gap"):
+                            self.endpoint.capture_gap = True
+                        self.endpoint.finalize(force=True)
+                        if hasattr(self.endpoint, "capture_gap"):
+                            self.endpoint.capture_gap = True
+                    expected_sequence = item.sequence + 1
+                    self.endpoint.on_frame(item.timestamp_ns, item.pcm[:item.valid_samples])
+                    needs_boundary = False
+                elif has_item:
+                    self.endpoint.finalize(force=True)
+            except Exception as exc:
+                needs_boundary = True
+                ui_update(status=f"❌ Ring capture worker error: {exc}")
+
+
+def prepare_asr_audio(audio_i16: np.ndarray) -> np.ndarray:
+    """Preserve captured PCM by default; the recognizer supplies its own Mel DSP."""
+    global last_prepared_audio
+    audio_f = np.asarray(audio_i16, dtype=np.int16).astype(np.float32) / 32768.0
+    if args.asr_preprocessing == "legacy":
+        filtered = np.empty_like(audio_f)
+        for i in range(0, audio_f.size, FRAME_SAMPLES):
+            filtered[i:i + FRAME_SAMPLES] = bandpass_voice(audio_f[i:i + FRAME_SAMPLES])
+        prepared = rms_normalize(pre_emphasis(filtered))
+    else:
+        prepared = audio_f
+    last_prepared_audio = np.ascontiguousarray(prepared, dtype=np.float32)
+    last_asr_diagnostics["model_input"] = {
+        "dtype": "float32", "byte_order": "little", "sample_rate": SAMPLE_RATE,
+        "samples": int(prepared.size), "preprocessing": args.asr_preprocessing,
+        "peak_abs": float(np.max(np.abs(prepared))) if prepared.size else 0.0,
+        "out_of_range_fraction": float(np.mean(np.abs(prepared) > 1.0)) if prepared.size else 0.0,
+        "sha256": hashlib.sha256(last_prepared_audio.astype("<f4", copy=False).tobytes()).hexdigest(),
+    }
+    return last_prepared_audio
+
+
+def retain_asr_evidence(audio_i16: np.ndarray, text: str, error: str | None = None) -> None:
+    raw_text = str(last_decoder_quality.get("raw_text", text))
+    reasons = issue_reasons(last_asr_diagnostics["pcm"], text, raw_text=raw_text,
+                            decoder_quality=last_decoder_quality,
+                            expected_language=source_language().whisper, error=error,
+                            gap=bool(asr_request_context.get("capture_gap")))
+    if last_asr_diagnostics.get("model_input", {}).get("out_of_range_fraction", 0) > 0:
+        reasons.append("model_input_out_of_range")
+    if asr_request_context.get("forced_speech_boundary"):
+        reasons.append("forced_speech_boundary")
+    reasons.extend(last_asr_diagnostics.get("consistency_issues", []))
+    last_asr_diagnostics.update({"decoder": dict(last_decoder_quality), "text": text,
+                                 "issues": reasons, "error": error,
+                                 "quality_flags_are_not_measured_accuracy": True})
+    if audio_evidence is None or not audio_i16.size:
+        return
+    selected = reasons or (["debug"] if audio_review_mode == "full" else [])
+    if not selected:
+        return
+    metadata = {"session_id": runtime_session_id, "source_language": source_language_code(),
+                "backend": detected_stt_backend, "model": args.whisper_model,
+                **last_asr_diagnostics}
+    request_id = str(asr_request_context.get("request_id", "asr"))
+    raw_saved = audio_evidence.save_clip(audio_i16.astype("<i2", copy=False).tobytes(), metadata, selected,
+                                         label=f"{request_id}-raw")
+    prepared_saved = True
+    if last_prepared_audio is not None:
+        prepared_saved = audio_evidence.save_blob(last_prepared_audio.astype("<f4", copy=False).tobytes(), metadata,
+                                                  selected, label=f"{request_id}-model-input", suffix=".f32le")
+    # This is the inference worker, not capture. Persist admitted evidence
+    # before a fatal native error or worker exit can terminate its writer.
+    audio_evidence.flush(timeout=3)
+    last_asr_diagnostics["evidence"] = {"raw_accepted": raw_saved, "model_input_accepted": prepared_saved,
+                                         "writer": audio_evidence.snapshot}
+
+
+asr_preview_evidence: dict[int, str] = {}
 
 
 def transcribe_pcm_i16(audio_i16: np.ndarray, *, from_ring: bool = False, partial: bool = False) -> str:
+    global last_prepared_audio
+    audio_i16 = np.ascontiguousarray(audio_i16, dtype=np.int16)
+    last_prepared_audio = None
+    last_decoder_quality.clear()
+    last_asr_diagnostics.clear()
+    last_asr_diagnostics.update({"request": dict(asr_request_context), "partial": partial,
+                                 "pcm": pcm_quality(audio_i16), "decode_attempted": False})
+    started = time.perf_counter()
+    try:
+        text = _transcribe_pcm_i16_impl(audio_i16, from_ring=from_ring, partial=partial)
+    except Exception as exc:
+        last_asr_diagnostics["processing_seconds"] = time.perf_counter() - started
+        retain_asr_evidence(audio_i16, "", error=f"{type(exc).__name__}: {exc}")
+        raise
+    last_asr_diagnostics["processing_seconds"] = time.perf_counter() - started
+    identity = asr_request_context.get("utterance_id")
+    if identity is not None:
+        if partial:
+            if (text and not is_repetitive_text(text)
+                    and (last_decoder_quality.get("max_compression_ratio") or 0) <= 2.9
+                    and (last_decoder_quality.get("max_no_speech_prob") or 0) <= 0.6
+                    and len(text) > len(asr_preview_evidence.get(identity, ""))):
+                asr_preview_evidence[identity] = text[:2000]
+                while len(asr_preview_evidence) > 32:
+                    asr_preview_evidence.pop(next(iter(asr_preview_evidence)))
+        else:
+            preview = asr_preview_evidence.pop(identity, "")
+            if final_preview_disagrees(text, preview, audio_i16.size / SAMPLE_RATE):
+                last_asr_diagnostics["consistency_issues"] = ["final_preview_disagreement"]
+                last_asr_diagnostics["preview_evidence"] = preview
+    retain_asr_evidence(audio_i16, text)
+    return text
+
+
+def _transcribe_pcm_i16_impl(audio_i16: np.ndarray, *, from_ring: bool = False, partial: bool = False) -> str:
     if args.mode not in {"audio", "both"} or audio_i16.size == 0:
         return ""
     duration = audio_i16.size / SAMPLE_RATE
@@ -5216,17 +5831,27 @@ def transcribe_pcm_i16(audio_i16: np.ndarray, *, from_ring: bool = False, partia
         return ""
     if args.save_last_audio and not from_ring:
         save_wav(args.save_last_audio, audio_i16)
-    audio_f = audio_i16.astype(np.float32) * (1.0 / 32768.0)
-    use_bandpass = not (from_ring and args.disable_vpio_bandpass and resolve_audio_io_backend() == "apple-vpio")
-    if use_bandpass:
-        filtered = np.empty_like(audio_f, dtype=np.float32)
-        for i in range(0, len(audio_f), FRAME_SAMPLES):
-            filtered[i:i + FRAME_SAMPLES] = bandpass_voice(audio_f[i:i + FRAME_SAMPLES])
-    else:
-        filtered = audio_f
-    if rms_dbfs(filtered) < min_dbfs_utterance_threshold():
+    if rms_dbfs_i16(audio_i16) < min_dbfs_utterance_threshold():
         return ""
-    prepared = rms_normalize(pre_emphasis(filtered))
+    return decode_prepared_audio(prepare_asr_audio(audio_i16), partial=partial, from_ring=from_ring)
+
+
+def decode_prepared_audio(prepared: np.ndarray, *, partial: bool = False, from_ring: bool = True) -> str:
+    """Decode an exact recorded float input without applying capture DSP again."""
+    prepared = np.ascontiguousarray(prepared, dtype=np.float32)
+    if prepared.ndim != 1 or not np.all(np.isfinite(prepared)):
+        raise ValueError("ASR model input must be finite mono float32 audio")
+    backend, lane_model, lane_beam = effective_lane_backend(partial), effective_lane_model(partial), effective_lane_beam(partial)
+    last_asr_diagnostics["decode_attempted"] = True
+    actual_model = effective_mlx_vlm_model(partial) if backend == "mlx-vlm-gemma" else lane_model
+    if backend == "mlx-whisper":
+        actual_model = resolve_mlx_whisper_model_ref_for(lane_model)
+    last_asr_diagnostics["decoder_config"] = {
+        "backend": backend, "model": actual_model, "partial": partial, "requested_beam": lane_beam,
+        "language": asr_language_display(), "task": "transcribe", "temperature": 0.0,
+        "condition_on_previous_text": False, "initial_prompt": stt_initial_prompt(),
+        "filter_thresholds": list(anti_repeat_thresholds()),
+    }
     if backend == "whispercpp-coreml":
         return sanitize_asr_language_shape(sanitize_asr_text(transcribe_audio_whispercpp_coreml(prepared, beam=lane_beam), final=not partial), final=not partial)
     if backend == "apple-speech":
@@ -5275,8 +5900,8 @@ audio_lock = threading.Lock()
 capture_frames: Queue[bytes] = Queue(maxsize=max(2, args.capture_queue_ms // FRAME_MS))
 audio_tasks: Queue[AudioTask] = Queue(maxsize=max(1, args.audio_queue_size))
 asr_results: Queue[AsrResult] = Queue(maxsize=max(1, args.audio_queue_size * 2))
-mt_tasks: PriorityQueue[PrioritizedTranslationTask] = PriorityQueue()
-tts_tasks: Queue[TtsTask] = Queue(maxsize=max(1, args.tts_queue_size))
+mt_tasks: PriorityQueue[PrioritizedTranslationTask] = PriorityQueue(maxsize=max(1, args.inference_queue_size))
+tts_tasks: Queue[TtsTask] = Queue(maxsize=max(16, args.tts_queue_size))
 shutdown_event = threading.Event()
 tts_playing = threading.Event()
 mt_revision_lock = threading.Lock()
@@ -5292,6 +5917,15 @@ mt_ipc_ctx: mp.context.BaseContext | None = None
 mt_ipc_in = None
 mt_ipc_out = None
 mt_process: mp.Process | None = None
+asr_stage: ProcessStage | None = None
+translation_stage: ProcessStage | None = None
+translation_thread_error = ""
+translation_stage_results: Queue[TranslationResult] = Queue(maxsize=128)
+selection_tasks: dict[str, SelectionTask] = {}
+selection_tasks_lock = threading.Lock()
+stage_diagnostics_stream = None
+pending_stage_asr: set[int] = set()
+pending_stage_asr_lock = threading.Lock()
 asr_slot_free: Queue[int] = Queue()
 asr_slot_shms: dict[int, shared_memory.SharedMemory] = {}
 asr_slot_size = int((MAX_UTTERANCE_SECONDS + 1.0) * SAMPLE_RATE * 2)
@@ -5329,37 +5963,91 @@ current_partial_last_change_ms = 0.0
 current_partial_locked_prefix = ""
 current_partial_locked_ratio = 0.0
 current_partial_revision = 0
+current_partial_utterance_id: int | None = None
+current_partial_state_lock = threading.RLock()
 
 
-def reset_current_partial_state() -> None:
+def reset_current_partial_state(utterance_id: int | None = None, *, next_utterance_id: int | None = None) -> None:
     global current_partial_text, current_partial_display_text, current_partial_display_locked_prefix
-    global current_partial_stability, current_partial_last_change_ms, current_partial_locked_prefix, current_partial_locked_ratio, current_partial_revision
-    current_partial_text = ""
-    current_partial_display_text = ""
-    current_partial_display_locked_prefix = ""
-    current_partial_stability = 0
-    current_partial_last_change_ms = 0.0
-    current_partial_locked_prefix = ""
-    current_partial_locked_ratio = 0.0
-    current_partial_revision = 0
+    global current_partial_stability, current_partial_last_change_ms, current_partial_locked_prefix, current_partial_locked_ratio, current_partial_revision, current_partial_utterance_id
+    with current_partial_state_lock:
+        if utterance_id is not None and current_partial_utterance_id not in {None, utterance_id}:
+            return
+        current_partial_text = ""
+        current_partial_display_text = ""
+        current_partial_display_locked_prefix = ""
+        current_partial_stability = 0
+        current_partial_last_change_ms = 0.0
+        current_partial_locked_prefix = ""
+        current_partial_locked_ratio = 0.0
+        current_partial_revision = 0
+        current_partial_utterance_id = next_utterance_id
 
 
-def enqueue_translation_task(task: TranslationTask) -> None:
+def partial_endpoint_snapshot(utterance_id: int) -> tuple[str, int, float, float]:
+    """Take one coherent endpoint hint, excluding another utterance's results."""
+    with current_partial_state_lock:
+        if current_partial_utterance_id != utterance_id:
+            return "", 0, 0.0, 0.0
+        return (
+            current_partial_text, current_partial_stability,
+            current_partial_last_change_ms, current_partial_locked_ratio,
+        )
+
+
+def enqueue_translation_task(task: TranslationTask) -> bool:
+    if translation_thread_error:
+        ui_update(status=f"❌ Translation unavailable: {translation_thread_error}")
+        return False
     if task.source == "audio":
         trace_update(
             task.utterance_id,
             **({"mt_partial_enqueued_at": time.perf_counter()} if task.partial else {"mt_final_enqueued_at": time.perf_counter()}),
         )
-    if task.source == "audio" and task.utterance_id is not None:
+    if translation_stage is not None:
+        accepted = translation_stage.submit(task, partial=task.partial,
+                                            key=(task.source, task.utterance_id))
+        if not accepted:
+            if not task.partial:
+                ui_update(status=f"❌ Translation not queued: {translation_stage.state}. Input is retained; check worker status or reduce the backlog.")
+            return False
+    elif mt_ipc_in is not None:
+        accepted = queue_put_translation_task(mt_ipc_in, task, "mt")
+    else:
+        accepted = queue_put_translation_task(mt_tasks, task, "mt")
+    if accepted and task.source == "audio" and task.utterance_id is not None:
         with mt_revision_lock:
             latest_enqueued_audio_revision[task.utterance_id] = max(
                 latest_enqueued_audio_revision.get(task.utterance_id, 0),
                 task.revision,
             )
-    if mt_ipc_in is not None:
-        queue_put_translation_task(mt_ipc_in, task, "mt")
-    else:
-        queue_put_translation_task(mt_tasks, task, "mt")
+    return accepted
+
+
+def submit_typed_reply(text: str) -> bool:
+    """A rejected submission keeps the editable input rather than clearing it."""
+    global text_entry_seq
+    normalized = normalize_text(text)
+    if not normalized:
+        return False
+    text_entry_seq += 1
+    entry_id = text_entry_seq
+    with ui_lock:
+        ui_set_panel_entry("right", entry_id, "src", f"⌨️ {target_label()}: {color_right_en(normalized)}", final=True)
+    with session_log_lock:
+        typed_input_texts[entry_id] = normalized
+    accepted = enqueue_translation_task(TranslationTask(
+        source="text", text=normalized, src_lang=target_nllb_lang(),
+        beams=max(1, args.mt_beams), target_lang=source_language_code(),
+        forced_bos_id=forced_bos_for_target(source_language_code()), utterance_id=entry_id,
+    ))
+    if not accepted:
+        with session_log_lock:
+            typed_input_texts.pop(entry_id, None)
+        with ui_lock:
+            ui_remove_panel_entry("right", entry_id)
+    render_input("" if accepted else text)
+    return accepted
 
 
 def is_stale_audio_translation(task: TranslationTask) -> bool:
@@ -5443,54 +6131,68 @@ def queue_task_done_if_supported(q) -> None:
         q.task_done()
 
 
-def drop_one_speculative_translation_task(q, label: str) -> bool:
-    kept = []
-    dropped = False
-    try:
-        while True:
-            item = q.get_nowait()
-            queue_task_done_if_supported(q)
-            if not dropped and is_speculative_translation_task(item):
-                dropped = True
-                if args.debug:
-                    log_debug(f"dropped stale speculative {label} translation task to preserve committed work")
-                continue
-            kept.append(item)
-    except Empty:
-        pass
+def _remove_optional_queue_item_locked(q: Queue, predicate) -> bool:
+    """Remove one disposable item while the standard queue mutex is held."""
+    for index, queued in enumerate(q.queue):
+        if predicate(queued):
+            del q.queue[index]
+            if isinstance(q, PriorityQueue):
+                heapify(q.queue)
+            q.unfinished_tasks -= 1
+            if q.unfinished_tasks == 0:
+                q.all_tasks_done.notify_all()
+            q.not_full.notify()
+            return True
+    return False
 
-    for item in kept:
-        while not shutdown_event.is_set():
-            try:
-                q.put_nowait(item)
-                break
-            except Full:
-                time.sleep(0.001)
+
+def _drop_optional_queue_item(q, predicate) -> bool:
+    # Multiprocessing queues have no public atomic inspection operation. Refuse
+    # eviction there rather than draining/reinserting someone else's committed
+    # work, which can race with producers or stall indefinitely on a full queue.
+    if not isinstance(q, Queue):
+        return False
+    with q.mutex:
+        return _remove_optional_queue_item_locked(q, predicate)
+
+
+def _put_without_waiting(q, item, optional_predicate) -> bool:
+    """Atomically replace only optional work; never wait for queue capacity."""
+    if shutdown_event.is_set():
+        return False
+    if isinstance(q, Queue):
+        with q.mutex:
+            if q.maxsize > 0 and q._qsize() >= q.maxsize:
+                if not _remove_optional_queue_item_locked(q, optional_predicate):
+                    return False
+            q._put(item)
+            q.unfinished_tasks += 1
+            q.not_empty.notify()
+            return True
+    try:
+        q.put_nowait(item)
+        return True
+    except Full:
+        return False
+
+
+def drop_one_speculative_translation_task(q, label: str) -> bool:
+    dropped = _drop_optional_queue_item(q, is_speculative_translation_task)
+    if dropped and args.debug:
+        log_debug(f"dropped stale speculative {label} translation task to preserve committed work")
     return dropped
 
 
 def queue_put_translation_task(q, task: TranslationTask, label: str) -> bool:
     item = wrap_translation_task(task) if isinstance(q, PriorityQueue) else task
-    while not shutdown_event.is_set():
-        try:
-            q.put_nowait(item)
-            return True
-        except Full:
-            if drop_one_speculative_translation_task(q, label):
-                continue
-
-            if is_speculative_translation_task(item):
-                if args.debug:
-                    log_debug(f"dropped speculative {label} translation task because higher-priority work is queued")
-                return False
-
-            try:
-                q.put(item, timeout=0.05)
-                return True
-            except Full:
-                if args.debug:
-                    log_debug(f"waiting for committed {label} translation queue capacity")
-                continue
+    if _put_without_waiting(q, item, is_speculative_translation_task):
+        return True
+    if task.source == "text":
+        ui_update(status="❌ Translation queue is full or stopping; this typed reply was not queued. Keep the text and retry after pending work finishes.")
+    elif not task.partial:
+        ui_update(status="❌ Translation queue is full or stopping; this final transcript was not queued for translation.")
+    elif args.debug:
+        log_debug(f"dropped speculative {label} translation task because higher-priority work is queued")
     return False
 
 
@@ -5499,28 +6201,9 @@ def is_stale_audio_tts_task(item) -> bool:
 
 
 def drop_one_stale_audio_tts_task(q: Queue, label: str) -> bool:
-    kept = []
-    dropped = False
-    try:
-        while True:
-            item = q.get_nowait()
-            queue_task_done_if_supported(q)
-            if not dropped and is_stale_audio_tts_task(item):
-                dropped = True
-                if args.debug:
-                    log_debug(f"dropped queued audio {label} task to preserve typed TTS")
-                continue
-            kept.append(item)
-    except Empty:
-        pass
-
-    for item in kept:
-        while not shutdown_event.is_set():
-            try:
-                q.put_nowait(item)
-                break
-            except Full:
-                time.sleep(0.001)
+    dropped = _drop_optional_queue_item(q, is_stale_audio_tts_task)
+    if dropped and args.debug:
+        log_debug(f"dropped queued audio {label} task to preserve typed TTS")
     return dropped
 
 
@@ -5530,26 +6213,12 @@ def queue_put_tts_task(q: Queue, task: TtsTask, label: str) -> bool:
     Text replies are user-authored and must be preserved. Optional spoken audio
     translations are allowed to coalesce behind newer audio, but never evict text.
     """
-    while not shutdown_event.is_set():
-        try:
-            q.put_nowait(task)
-            return True
-        except Full:
-            if drop_one_stale_audio_tts_task(q, label):
-                continue
-
-            if task.source == "audio":
-                if args.debug:
-                    log_debug(f"dropped incoming audio {label} task behind committed typed TTS")
-                return False
-
-            try:
-                q.put(task, timeout=0.05)
-                return True
-            except Full:
-                if args.debug:
-                    log_debug(f"waiting for committed text {label} queue capacity")
-                continue
+    if _put_without_waiting(q, task, is_stale_audio_tts_task):
+        return True
+    if task.source == "text":
+        ui_update(status="❌ Speech queue is full or stopping; this reply was not queued for speech. Its translated text remains visible.")
+    elif args.debug:
+        log_debug(f"dropped incoming audio {label} task behind committed typed TTS")
     return False
 
 
@@ -5681,15 +6350,18 @@ def force_flush_audio() -> None:
         flush_active_locked(force=True)
 
 
+def capture_paused_for_playback() -> bool:
+    """Only explicit half-duplex capture pauses for playback or its tail guard."""
+    return not args.duplex_capture and (tts_playing.is_set() or time.time() < playback_guard_until)
+
+
 def process_capture_frame(pcm: bytes) -> None:
     global in_speech, silence_ms, hangover_ms, adaptive_silence_ms, pause_ewma_ms
     global speech_run_ms, speech_frames, total_frames, noise_floor_db, pre_roll, playback_duck_ms, playback_guard_until, current_partial_text, current_partial_stability, current_partial_last_change_ms, current_partial_locked_prefix, current_partial_locked_ratio, current_partial_revision
 
     if shutdown_event.is_set():
         return
-    if time.time() < playback_guard_until:
-        return
-    if tts_playing.is_set() and not args.duplex_capture:
+    if capture_paused_for_playback():
         return
     pre_roll.append(pcm)
     if len(pre_roll) > pre_roll_max:
@@ -5708,17 +6380,11 @@ def process_capture_frame(pcm: bytes) -> None:
         speech_vad = is_silero_speech_frame(frame_i16)
     else:
         speech_vad = False
-    if tts_playing.is_set() and args.duplex_capture:
-        if frame_db > noise_floor_db + args.tts_bleed_duck_db and not speech_vad:
-            playback_duck_ms = args.tts_bleed_hold_ms
-        elif playback_duck_ms > 0:
-            playback_duck_ms = max(0, playback_duck_ms - FRAME_MS)
-    else:
-        playback_duck_ms = 0
-
+    # Full-duplex listening must not classify all energy-VAD speech as playback
+    # bleed while a reply is spoken. Echo suppression belongs in the selected
+    # input route (for example VPIO); half-duplex is an explicit opt-out.
+    playback_duck_ms = 0
     speech = bool(speech_vad or loud_enough)
-    if playback_duck_ms > 0 and not speech_vad:
-        speech = False
 
     with audio_lock:
         if speech:
@@ -5732,7 +6398,7 @@ def process_capture_frame(pcm: bytes) -> None:
                 speech_run_ms = 0
                 speech_frames = 0
                 total_frames = 0
-                reset_current_partial_state()
+                reset_current_partial_state(next_utterance_id=utterance_seq)
             active_frames.append(pcm)
             utterance_frames.append(pcm)
             speech_run_ms += FRAME_MS
@@ -5745,20 +6411,21 @@ def process_capture_frame(pcm: bytes) -> None:
             else:
                 silence_ms += FRAME_MS
                 pause_ewma_ms = (1.0 - args.adapt_alpha) * pause_ewma_ms + args.adapt_alpha * float(silence_ms)
+                endpoint_text, endpoint_stability, endpoint_last_change, endpoint_locked_ratio = partial_endpoint_snapshot(utterance_seq)
                 adaptive_silence_ms = compute_adaptive_threshold(pause_ewma_ms, speech_run_ms)
-                adaptive_silence_ms = semantic_endpoint_threshold(adaptive_silence_ms, current_partial_text)
-                adaptive_silence_ms = transcript_stability_bias(adaptive_silence_ms, current_partial_stability, current_partial_last_change_ms)
-                commit_confidence = commit_confidence_score(current_partial_text, current_partial_stability, current_partial_last_change_ms, silence_ms, current_partial_locked_ratio)
+                adaptive_silence_ms = semantic_endpoint_threshold(adaptive_silence_ms, endpoint_text)
+                adaptive_silence_ms = transcript_stability_bias(adaptive_silence_ms, endpoint_stability, endpoint_last_change)
+                commit_confidence = commit_confidence_score(endpoint_text, endpoint_stability, endpoint_last_change, silence_ms, endpoint_locked_ratio)
                 adaptive_silence_ms = confidence_adjusted_endpoint_threshold(adaptive_silence_ms, commit_confidence)
-                if args.debug and current_partial_text:
-                    score = sentence_completeness_score(current_partial_text)
-                    log_debug(f"endpoint score={score} stability={current_partial_stability} locked_ratio={current_partial_locked_ratio:.2f} last_change_ms={current_partial_last_change_ms:.0f} silence_ms={silence_ms} confidence={commit_confidence} threshold_ms={adaptive_silence_ms}")
+                if args.debug and endpoint_text:
+                    score = sentence_completeness_score(endpoint_text)
+                    log_debug(f"endpoint score={score} stability={endpoint_stability} locked_ratio={endpoint_locked_ratio:.2f} last_change_ms={endpoint_last_change:.0f} silence_ms={silence_ms} confidence={commit_confidence} threshold_ms={adaptive_silence_ms}")
                 semantic_commit = should_semantic_endpoint(
-                    current_partial_text,
-                    current_partial_stability,
-                    current_partial_last_change_ms,
+                    endpoint_text,
+                    endpoint_stability,
+                    endpoint_last_change,
                     silence_ms,
-                    current_partial_locked_ratio,
+                    endpoint_locked_ratio,
                 )
                 if semantic_commit or silence_ms >= adaptive_silence_ms:
                     if args.debug and semantic_commit:
@@ -5776,7 +6443,17 @@ def process_capture_frame(pcm: bytes) -> None:
 
 
 def audio_callback(indata, frames, time_info, status):
-    if shutdown_event.is_set() or status:
+    if shutdown_event.is_set():
+        return
+    if audio_evidence is not None:
+        timestamp_ns = time.monotonic_ns() - int(frames) * 1_000_000_000 // SAMPLE_RATE
+        if audio_review_mode == "full":
+            audio_evidence.capture(indata[:, 0], timestamp_ns=timestamp_ns, discontinuity=bool(status))
+        if status:
+            audio_evidence.save_clip(indata[:, 0], {"source_language": source_language_code(),
+                                                    "capture_status": str(status), "streaming_engine": "legacy"},
+                                     ["capture_status"], label="capture-issue", timestamp_ns=timestamp_ns)
+    if status:
         return
     queue_put_latest_silent(capture_frames, indata[:, 0].tobytes())
 
@@ -5813,6 +6490,304 @@ def asr_result_from_task(task: AudioTask) -> AsrResult:
         shm_name=task.shm_name,
         slot_id=task.slot_id,
     )
+
+
+asr_decisions_lock = threading.Lock()
+
+
+def record_asr_decision(result: AsrResult, text: str, decision: str, reason: str = "") -> None:
+    """Keep source recognition independent of MT success and make losses auditable."""
+    if not args.session_logs or runtime_session_dir is None:
+        return
+    diagnostics = result.diagnostics or {}
+    decoder = diagnostics.get("decoder", {})
+    raw_text = str(decoder.get("raw_text", result.text or ""))
+    payload = {
+        "timestamp": datetime.now(timezone.utc).isoformat(), "session_id": runtime_session_id,
+        "utterance_id": result.utterance_id, "request_id": result.request_id,
+        "decision": decision, "reason": reason, "source_language": source_language_code(),
+        "text": str(text)[:16000], "raw_text": raw_text[:16000],
+        "text_truncated": len(str(text)) > 16000 or len(raw_text) > 16000,
+        "request": diagnostics.get("request", {}), "issues": diagnostics.get("issues", []),
+        "decoder_quality": {key: decoder.get(key) for key in (
+            "mean_avg_logprob", "min_avg_logprob", "max_no_speech_prob", "max_compression_ratio",
+            "requested_beam", "effective_beam", "detected_language")},
+        "processing_seconds": diagnostics.get("processing_seconds"),
+    }
+    try:
+        with asr_decisions_lock:
+            with (runtime_session_dir / "asr-decisions.jsonl").open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(payload, ensure_ascii=False, allow_nan=False) + "\n")
+    except (OSError, ValueError) as exc:
+        log_debug(f"could not write ASR decision journal: {exc}")
+    if audio_evidence is not None:
+        audio_evidence.event({"kind": "asr_decision", **payload})
+
+
+def configure_inference_diagnostics(stage: str) -> None:
+    """Keep child/library output out of the interactive terminal dashboard."""
+    global stage_diagnostics_stream, runtime_session_id, runtime_session_dir, runtime_audio_dir, audio_review_mode, audio_evidence
+    runtime_session_id = os.environ.get("TTS_TRANSLATE_SESSION_ID", runtime_session_id)
+    directory = Path(os.environ.get("TTS_TRANSLATE_SESSION_DIR") or str(Path(__file__).resolve().parent / "runtime-reports"))
+    runtime_session_dir = directory
+    directory.mkdir(exist_ok=True)
+    stage_diagnostics_stream = (directory / f"{stage}-worker.log").open("a", buffering=1, encoding="utf-8")
+    sys.stdout = stage_diagnostics_stream
+    sys.stderr = stage_diagnostics_stream
+    eprint(f"\n--- {datetime.now(timezone.utc).isoformat()} {stage} starting ---")
+    if stage == "asr" and os.environ.get("TTS_TRANSLATE_AUDIO_DIR"):
+        runtime_audio_dir = Path(os.environ["TTS_TRANSLATE_AUDIO_DIR"])
+        audio_review_mode = os.environ.get("TTS_TRANSLATE_AUDIO_MODE", "issues")
+        if audio_review_mode != "off":
+            audio_evidence = AudioEvidence(runtime_audio_dir, role="asr", full_stream=False,
+                                           max_clip_bytes=args.issue_audio_budget_mb * 1024 * 1024)
+            from multiprocessing.util import Finalize
+            Finalize(audio_evidence, audio_evidence.close, exitpriority=10)
+
+
+def initialize_asr_stage(configuration: dict | None = None) -> None:
+    if configuration:
+        vars(args).update(configuration)
+    configure_inference_diagnostics("asr")
+    init_stt_runtime_only()
+    # Fail native initialization in this worker once, rather than repeatedly
+    # retrying a poisoned extension from capture or UI threads.
+    if detected_stt_backend == "mlx-whisper":
+        ensure_mlx_whisper_loaded()
+    elif detected_stt_backend == "mlx-vlm-gemma":
+        init_mlx_vlm_gemma_runtime(effective_mlx_vlm_model(partial=False))
+    warmup_stt_runtime_only(report=False, strict=True)
+
+
+def handle_asr_stage_request(payload, emit) -> None:
+    global asr_request_context
+    utterance_id, partial, pcm = payload[:3]
+    metadata = dict(payload[3]) if len(payload) > 3 else {}
+    actual_hash = hashlib.sha256(np.ascontiguousarray(pcm, dtype="<i2").tobytes()).hexdigest()
+    asr_request_context = {**metadata, "actual_pcm_sha256": actual_hash, "utterance_id": utterance_id}
+    if metadata.get("pcm_sha256", actual_hash) != actual_hash:
+        if audio_evidence is not None:
+            audio_evidence.save_clip(pcm, asr_request_context, ["request_pcm_integrity_mismatch"], label="mismatched-input")
+            audio_evidence.flush()
+        raise RuntimeError("ASR request PCM integrity mismatch; refusing to decode another buffer")
+    text = normalize_text(transcribe_pcm_i16(pcm, from_ring=True, partial=partial))
+    emit(AsrResult(utterance_id=utterance_id, text=text, partial=partial,
+                   request_id=metadata.get("request_id", ""), session_id=metadata.get("session_id", ""),
+                   pcm_sha256=actual_hash, diagnostics=dict(last_asr_diagnostics)))
+
+
+def initialize_translation_stage(configuration: dict | None = None) -> None:
+    if configuration:
+        vars(args).update(configuration)
+    configure_inference_diagnostics("translation")
+    init_translation_runtime_only()
+    warmup_translation_runtime_only(report=False, strict=True)
+
+
+def handle_translation_stage_request(task: TranslationTask, emit) -> None:
+    if isinstance(task, SelectionTask):
+        with translation_lock:
+            translated = translate_chunk(task.text, language_spec(task.source_language).nllb,
+                                         forced_bos_for_target(task.target_language), 1)
+        translated = strip_model_thinking(translated)
+        emit(SelectionResult(task, translated, "" if translated else "Selection translation returned no text"))
+        return
+    # The parent uses direction markers only; actual NLLB token IDs are owned
+    # by the child tokenizer. MLX uses the structured language codes instead.
+    task.forced_bos_id = forced_bos_for_target(task.target_lang)
+    emit_translation_results(task, emit)
+
+
+def brief_worker_detail(detail: str) -> str:
+    if "No Metal device available" in detail:
+        return "No Metal device available in this session"
+    return detail.strip().splitlines()[-1] if detail.strip() else ""
+
+
+def on_inference_event(event: StageEvent) -> None:
+    if event.kind == "done" and runtime_session_dir is not None:
+        try:
+            with (runtime_session_dir / "inference-timing.jsonl").open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps({"time": datetime.now(timezone.utc).isoformat(), "stage": event.stage,
+                    "job_id": event.job_id, "key": event.key, "partial": event.partial,
+                    "background": event.background, "queue_wait_seconds": event.queue_wait_seconds,
+                    "request_seconds": event.request_seconds}) + "\n")
+        except OSError as exc:
+            log_debug(f"could not write inference timing: {exc}")
+    if event.stage == "translation":
+        if event.kind == "failed":
+            with selection_tasks_lock:
+                identities = list(selection_tasks)
+            for identity in identities:
+                fail_selection_task(identity, "Translation worker failed; restart the session")
+        elif event.kind in {"discarded", "rejected"} and isinstance(event.key, tuple) and event.key[:1] == ("lookup",):
+            fail_selection_task(event.key[1], event.detail or "Live work superseded the selection; select it again")
+    detail = brief_worker_detail(event.detail)
+    if event.kind in {"loading", "ready", "busy", "done", "failed", "closed"}:
+        update_stage_status(event.stage, event.state, detail)
+    if event.kind in {"failed", "rejected", "callback_error"} and not (event.kind == "rejected" and event.background):
+        directory = runtime_session_dir or Path(__file__).resolve().parent / "runtime-reports"
+        directory.mkdir(exist_ok=True)
+        with (directory / "pipeline-events.jsonl").open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"time": datetime.now(timezone.utc).isoformat(),
+                                     "stage": event.stage, "kind": event.kind,
+                                     "detail": event.detail}, ensure_ascii=False) + "\n")
+        if event.kind == "failed" and event.stage == "asr":
+            with pending_stage_asr_lock:
+                pending = tuple(pending_stage_asr)
+                pending_stage_asr.clear()
+                pending_clips = tuple(pending_audio_evidence.values())
+                pending_audio_evidence.clear()
+            if audio_evidence is not None:
+                for pcm, metadata in pending_clips:
+                    audio_evidence.save_clip(pcm, {**metadata, "worker_error": event.detail},
+                                             ["worker_failure_pending_input"], label=metadata.get("request_id", "failed"))
+            for utterance_id in pending:
+                clear_final_asr_pending(utterance_id)
+                clear_inflight_partial_marker(utterance_id)
+                if ring_scheduler is not None:
+                    with ring_scheduler.lock:
+                        ring_scheduler.final_submitted.discard(utterance_id)
+                        ring_scheduler.cancelled_partials.discard(utterance_id)
+        if event.kind != "rejected" or not event.partial:
+            ui_update(status=f"❌ {event.stage}: {detail or event.kind}. See {directory / 'pipeline-events.jsonl'}")
+
+
+def receive_asr_stage_result(result: AsrResult) -> None:
+    if result.session_id and result.session_id != runtime_session_id:
+        ui_update(status="❌ Rejected an ASR result from another session")
+        return
+    with pending_stage_asr_lock:
+        expected = pending_audio_evidence.get(result.utterance_id)
+        if expected is not None and result.request_id:
+            metadata = expected[1]
+            if result.request_id != metadata.get("request_id"):
+                return
+            elif result.pcm_sha256 != metadata["pcm_sha256"]:
+                ui_update(status="❌ ASR result audio hash mismatch; result quarantined")
+                return
+            else:
+                pending_audio_evidence.pop(result.utterance_id, None)
+    evidence = result.diagnostics.get("evidence", {})
+    if evidence and (not evidence.get("raw_accepted", True) or not evidence.get("model_input_accepted", True)):
+        ui_update(status="⚠️ Audio review storage limit reached or writer unavailable; check this session's recording summary")
+    quality = result.diagnostics.get("decoder", {})
+    if (result.partial and (quality.get("max_compression_ratio") or 0) > 2.9
+            and is_repetitive_text(result.text)):
+        # A pathological preview loop is not useful live text or MT input.
+        # Retain its diagnostic audio and wait for authoritative final ASR.
+        record_asr_decision(result, result.text, "partial_review_only", "Repetitive high-compression preview held for final decoding")
+        clear_inflight_partial_marker(result.utterance_id)
+        return
+    if result.partial and ring_scheduler is not None:
+        with ring_scheduler.lock:
+            if result.utterance_id in ring_scheduler.final_submitted:
+                return
+    if not result.partial:
+        with pending_stage_asr_lock:
+            pending_stage_asr.discard(result.utterance_id)
+        if ring_scheduler is not None:
+            with ring_scheduler.lock:
+                ring_scheduler.final_submitted.discard(result.utterance_id)
+                ring_scheduler.cancelled_partials.discard(result.utterance_id)
+    if not queue_put_asr_result(asr_results, result, "supervised-asr") and not result.partial:
+        clear_final_asr_pending(result.utterance_id)
+
+
+def receive_translation_stage_result(result: TranslationResult) -> None:
+    if isinstance(result, SelectionResult):
+        publish_selection_result(result)
+        return
+    optional = lambda queued: queued.stream_delta or queued.partial
+    while not shutdown_event.is_set():
+        if _put_without_waiting(translation_stage_results, result, optional):
+            return
+        if optional(result):
+            return
+        # Only this dedicated result-delivery thread may wait for committed
+        # output capacity. Capture/UI submit and the model watchdog remain
+        # independent; accepted final text must never be silently discarded.
+        try:
+            translation_stage_results.put(result, timeout=0.1)
+            return
+        except Full:
+            continue
+
+
+def start_asr_stage() -> None:
+    global asr_stage
+    if asr_stage is not None:
+        return
+    asr_stage = ProcessStage("asr", initialize_asr_stage, handle_asr_stage_request,
+                             initargs=(vars(args).copy(),),
+                             capacity=args.inference_queue_size,
+                             startup_timeout=args.startup_timeout,
+                             request_timeout=args.inference_timeout,
+                             on_event=on_inference_event, on_result=receive_asr_stage_result)
+    asr_stage.start()
+
+
+def submit_asr_stage(utterance_id: int, pcm: np.ndarray, partial: bool, provenance: dict | None = None) -> bool:
+    global asr_request_sequence
+    if asr_stage is None:
+        return False
+    if not partial:
+        mark_final_asr_pending(utterance_id)
+        with pending_stage_asr_lock:
+            pending_stage_asr.add(utterance_id)
+    snapshot = np.ascontiguousarray(pcm, dtype=np.int16).copy()
+    with pending_stage_asr_lock:
+        asr_request_sequence += 1
+        metadata = {"request_id": f"u{utterance_id}-{'p' if partial else 'f'}-{asr_request_sequence}",
+                    "session_id": runtime_session_id, "samples": int(snapshot.size),
+                    "source_language": source_language_code(), "partial": partial,
+                    "pcm_sha256": hashlib.sha256(snapshot.astype("<i2", copy=False).tobytes()).hexdigest(),
+                    **(provenance or {})}
+        previous = pending_audio_evidence.get(utterance_id)
+        pending_audio_evidence[utterance_id] = (snapshot, metadata)
+    accepted = asr_stage.submit((utterance_id, partial, snapshot, metadata),
+                                partial=partial, key=utterance_id)
+    if accepted:
+        with pending_stage_asr_lock:
+            while len(pending_audio_evidence) > max(32, args.inference_queue_size * 2):
+                pending_audio_evidence.pop(next(iter(pending_audio_evidence)))
+    else:
+        with pending_stage_asr_lock:
+            current = pending_audio_evidence.get(utterance_id)
+            if current is not None and current[1]["request_id"] == metadata["request_id"]:
+                if previous is None:
+                    pending_audio_evidence.pop(utterance_id, None)
+                else:
+                    pending_audio_evidence[utterance_id] = previous
+    if not accepted and not partial:
+        if audio_evidence is not None:
+            audio_evidence.save_clip(snapshot, metadata, ["asr_request_rejected"], label=metadata["request_id"])
+        with pending_stage_asr_lock:
+            pending_stage_asr.discard(utterance_id)
+        clear_final_asr_pending(utterance_id)
+        ui_update(status=f"❌ ASR request not queued: {asr_stage.state}; capture continues. Check worker status/backlog.")
+    return accepted
+
+
+def update_capture_status(feeder: RingAudioFeeder) -> None:
+    received = feeder.captured_samples / SAMPLE_RATE
+    age = time.monotonic() - feeder.last_input_at if feeder.last_input_at else float("inf")
+    if age > 2.0:
+        state, detail = "no input", "No PCM received in 2s; check selected input/LitLink routing and microphone permission"
+    else:
+        level = getattr(feeder.endpoint, "last_dbfs", -100.0)
+        speech = "speech" if feeder.endpoint.in_speech else "silence"
+        state, detail = "listening", f"{received:.1f}s received | {level:.0f} dBFS | {speech} | dropped {feeder.dropped_samples} samples"
+    if audio_evidence is not None:
+        recording = audio_evidence.snapshot
+        if recording["error"] or recording["rejected_capture_samples"] or recording["rejected_artifacts"]:
+            detail += f" | REVIEW WARNING: dropped {recording['rejected_capture_samples']} recording samples; rejected {recording['rejected_artifacts']} clips"
+    update_stage_status("capture", state, detail)
+    for name, stage in (("asr", asr_stage), ("translation", translation_stage)):
+        if stage is not None:
+            snapshot = stage.snapshot
+            error = brief_worker_detail(snapshot["error"])
+            update_stage_status(name, snapshot["state"], error or f"queued {snapshot['pending']}; active {snapshot['inflight_key']}")
 
 
 def asr_process_main(input_q, output_q) -> None:
@@ -5868,7 +6843,10 @@ def close_mp_queue(queue_obj) -> None:
 
 
 def stop_asr_process() -> None:
-    global asr_process, asr_ipc_in, asr_ipc_out, asr_ipc_ctx
+    global asr_process, asr_ipc_in, asr_ipc_out, asr_ipc_ctx, asr_stage
+    if asr_stage is not None:
+        asr_stage.close(timeout=2)
+        asr_stage = None
     if asr_ipc_in is not None:
         while True:
             try:
@@ -5926,7 +6904,11 @@ def asr_worker() -> None:
             if args.debug:
                 payload_bytes = task.num_bytes if task.num_bytes else (len(task.raw) if task.raw is not None else 0)
                 log_debug(f"ASR task partial={task.partial} utterance_id={task.utterance_id} bytes={payload_bytes}")
-            if asr_ipc_in is not None:
+            if asr_stage is not None:
+                pcm = np.frombuffer(task_audio_bytes(task), dtype=np.int16).copy()
+                submit_asr_stage(task.utterance_id, pcm, task.partial)
+                cleanup_audio_task_payload(task)
+            elif asr_ipc_in is not None:
                 queue_put_audio_task(asr_ipc_in, task, "asr-audio", has_task_done=False)
             else:
                 result = asr_result_from_task(task)
@@ -5961,6 +6943,7 @@ def asr_result_worker() -> None:
 def coordinator_worker() -> None:
     revision_cache: dict[int, int] = {}
     partial_cache: dict[int, str] = {}
+    partial_source_spans: dict[int, tuple | None] = {}
     partial_display_cache: dict[int, str] = {}
     stable_translation_cache: dict[int, str] = {}
     partial_translation_candidates: dict[int, PartialTranslationCandidate] = {}
@@ -5996,10 +6979,10 @@ def coordinator_worker() -> None:
     watchdog_forced_final_by_utt: set[int] = set()
     watchdog_closed_by_utt: set[int] = set()
     finalized_utterances: set[int] = set()
-    recent_final_transcripts: list[tuple[float, int, str]] = []
+    recent_final_transcripts: list[tuple[float, int, str, tuple | None]] = []
 
     global current_partial_text, current_partial_display_text, current_partial_display_locked_prefix
-    global current_partial_stability, current_partial_last_change_ms, current_partial_locked_prefix, current_partial_locked_ratio, current_partial_revision
+    global current_partial_stability, current_partial_last_change_ms, current_partial_locked_prefix, current_partial_locked_ratio, current_partial_revision, current_partial_utterance_id
 
     def watchdog_is_utterance_active(utterance_id: int) -> bool:
         endpoint = ring_endpoint
@@ -6018,6 +7001,7 @@ def coordinator_worker() -> None:
 
     def watchdog_close_utterance(utterance_id: int, reason: str) -> None:
         partial_cache.pop(utterance_id, None)
+        partial_source_spans.pop(utterance_id, None)
         partial_display_cache.pop(utterance_id, None)
         stable_translation_cache.pop(utterance_id, None)
         partial_translation_candidates.pop(utterance_id, None)
@@ -6025,6 +7009,7 @@ def coordinator_worker() -> None:
         revision_cache.pop(utterance_id, None)
         watchdog_clear_utterance(utterance_id)
         watchdog_closed_by_utt.add(utterance_id)
+        reset_current_partial_state(utterance_id)
         trace_drop(utterance_id)
         with ui_lock:
             ui_remove_panel_entry("left", utterance_id)
@@ -6037,30 +7022,31 @@ def coordinator_worker() -> None:
             return normalize_text(locked_prefix)
         return normalize_text(text)
 
-    def duplicate_recent_final_utterance_id(text: str, now: float) -> int | None:
+    def duplicate_recent_final_utterance_id(text: str, span: tuple | None, now: float) -> int | None:
         nonlocal recent_final_transcripts
         window_s = max(0.0, float(args.final_dedupe_window_ms) / 1000.0)
         if window_s <= 0:
             return None
         recent_final_transcripts = [
-            (ts, utt, previous_text)
-            for ts, utt, previous_text in recent_final_transcripts
+            (ts, utt, previous_text, previous_span)
+            for ts, utt, previous_text, previous_span in recent_final_transcripts
             if now - ts <= window_s
         ]
-        for _ts, utt, previous_text in reversed(recent_final_transcripts):
-            if final_transcripts_are_near_duplicates(previous_text, text):
+        for _ts, utt, previous_text, previous_span in reversed(recent_final_transcripts):
+            if (final_transcript_audio_spans_overlap(previous_span, span)
+                    and final_transcripts_are_near_duplicates(previous_text, text)):
                 return utt
         return None
 
-    def note_recent_final_transcript(utterance_id: int, text: str, now: float) -> None:
+    def note_recent_final_transcript(utterance_id: int, text: str, span: tuple | None, now: float) -> None:
         nonlocal recent_final_transcripts
         window_s = max(0.0, float(args.final_dedupe_window_ms) / 1000.0)
         if window_s <= 0:
             return
-        recent_final_transcripts.append((now, utterance_id, text))
+        recent_final_transcripts.append((now, utterance_id, text, span))
         recent_final_transcripts = [
-            (ts, utt, previous_text)
-            for ts, utt, previous_text in recent_final_transcripts
+            (ts, utt, previous_text, previous_span)
+            for ts, utt, previous_text, previous_span in recent_final_transcripts
             if now - ts <= window_s
         ]
 
@@ -6175,11 +7161,16 @@ def coordinator_worker() -> None:
             if fallback_text:
                 if args.debug:
                     log_debug(f"watchdog force-finalizing utterance={utterance_id} from last partial")
-                queue_put_asr_result(
+                accepted = _put_without_waiting(
                     asr_results,
                     AsrResult(utterance_id=utterance_id, text=fallback_text, partial=False),
-                    "watchdog-final",
+                    lambda queued: queued.partial,
                 )
+                if not accepted:
+                    # This watchdog is also the queue consumer. Waiting for
+                    # its own full queue would deadlock all ASR output. Keep
+                    # the cached partial and retry after draining queued work.
+                    watchdog_forced_final_by_utt.discard(utterance_id)
             else:
                 watchdog_close_utterance(utterance_id, "stuck partial filtered empty")
 
@@ -6195,6 +7186,10 @@ def coordinator_worker() -> None:
             previous_text = partial_cache.get(result.utterance_id, "")
             clear_inflight_partial_marker(result.utterance_id)
             if result.partial:
+                if result.utterance_id in finalized_utterances or result.utterance_id in watchdog_closed_by_utt:
+                    if args.debug:
+                        log_debug(f"dropped late partial ASR for closed utterance={result.utterance_id}")
+                    continue
                 result.text = sanitize_asr_text(result.text, final=False)
                 if not result.text:
                     if not previous_text:
@@ -6214,7 +7209,24 @@ def coordinator_worker() -> None:
                     asr_latest_partial_at=partial_seen_time,
                     **({} if "asr_first_partial_at" in trace else {"asr_first_partial_at": partial_seen_time}),
                 )
-                partial_text = merge_partial_transcript(previous_text, result.text)
+                previous_span = partial_source_spans.get(result.utterance_id)
+                current_span = final_transcript_audio_span(result)
+                partial_text = merge_partial_transcript_with_provenance(previous_text, result.text,
+                                                                          previous_span, current_span)
+                revises_prefix = bool(
+                    previous_text and previous_span is not None and current_span is not None
+                    and previous_span[:3] == current_span[:3] and current_span[3] >= previous_span[3]
+                    and not partial_text.startswith(previous_text)
+                )
+                if revises_prefix:
+                    # A corrected full-window hypothesis must not remain hidden
+                    # behind immutable words locked from the previous reading.
+                    stable_locks.pop(result.utterance_id, None)
+                    partial_display_cache.pop(result.utterance_id, None)
+                    partial_translation_candidates.pop(result.utterance_id, None)
+                    stable_translation_cache.pop(result.utterance_id, None)
+                if current_span is None or previous_span is None or current_span[3] >= previous_span[3]:
+                    partial_source_spans[result.utterance_id] = current_span
                 prev_words = previous_text.split()
                 cur_words = partial_text.split()
                 prefix_words = longest_common_prefix_word_count(prev_words, cur_words) if previous_text else 0
@@ -6240,16 +7252,15 @@ def coordinator_worker() -> None:
                     locked_ratio = (len(locked_prefix_words) / max(1, len(cur_words))) if cur_words else 0.0
                 if previous_text and not materially_changed:
                     stability_boost = 2 if similarity >= 0.9 and changed_tail_words <= 1 else 1
-                    current_partial_stability = min(8, current_partial_stability + stability_boost)
-                    current_partial_last_change_ms += max(1, FRAME_MS * stability_boost)
+                    _text, previous_stability, previous_last_change, _ratio = partial_endpoint_snapshot(result.utterance_id)
+                    partial_stability = min(8, previous_stability + stability_boost)
+                    partial_last_change_ms = previous_last_change + max(1, FRAME_MS * stability_boost)
                 else:
-                    current_partial_stability = 0 if not previous_text else 1
-                    current_partial_last_change_ms = 0.0
-                current_partial_locked_prefix = locked_prefix
-                current_partial_locked_ratio = locked_ratio
+                    partial_stability = 0 if not previous_text else 1
+                    partial_last_change_ms = 0.0
                 if args.debug and previous_text:
                     log_debug(
-                        f"partial similarity={similarity:.2f} prefix_words={prefix_words} overlap_words={overlap_words} locked_ratio={locked_ratio:.2f} changed_tail={changed_tail_words} stability={current_partial_stability}"
+                        f"partial similarity={similarity:.2f} prefix_words={prefix_words} overlap_words={overlap_words} locked_ratio={locked_ratio:.2f} changed_tail={changed_tail_words} stability={partial_stability}"
                     )
                 previous_display_text = partial_display_cache.get(result.utterance_id, "")
                 display_text = partial_display_source_text(partial_text, locked_prefix)
@@ -6266,14 +7277,25 @@ def coordinator_worker() -> None:
 
                 partial_cache[result.utterance_id] = partial_text
                 partial_display_cache[result.utterance_id] = display_text
-                current_partial_text = partial_text
-                current_partial_display_text = display_text
-                current_partial_display_locked_prefix = display_locked_prefix
                 previous_revision = revision_cache.get(result.utterance_id, 0)
-                display_changed = display_text != previous_display_text
+                display_changed = revises_prefix or display_text != previous_display_text
                 revision = previous_revision + 1 if display_changed else previous_revision
                 revision_cache[result.utterance_id] = revision
-                current_partial_revision = revision
+                # Capture may start a newer utterance while this result is
+                # sanitized/formatted. Recheck ownership at the actual commit.
+                # The same lock makes capture resets and endpoint snapshots
+                # atomic with this complete publication.
+                with current_partial_state_lock:
+                    if current_partial_utterance_id is None or result.utterance_id >= current_partial_utterance_id:
+                        current_partial_text = partial_text
+                        current_partial_display_text = display_text
+                        current_partial_display_locked_prefix = display_locked_prefix
+                        current_partial_stability = partial_stability
+                        current_partial_last_change_ms = partial_last_change_ms
+                        current_partial_locked_prefix = locked_prefix
+                        current_partial_locked_ratio = locked_ratio
+                        current_partial_utterance_id = result.utterance_id
+                        current_partial_revision = revision
                 display_is_inflight = not bool(display_text) or (args.partial_display_policy == "latest" and not display_locked_prefix)
                 with ui_lock:
                     ui_set_panel_entry(
@@ -6305,6 +7327,7 @@ def coordinator_worker() -> None:
                     log_debug(f"dropped duplicate final ASR for already-finalized utterance={result.utterance_id}")
                 continue
             if not final_text:
+                record_asr_decision(result, "", "empty_final", "No final text remained after ASR filtering")
                 if args.empty_final_action == "close":
                     watchdog_close_utterance(result.utterance_id, "empty final ASR")
                     continue
@@ -6316,8 +7339,11 @@ def coordinator_worker() -> None:
                 continue
 
             final_seen_at = time.perf_counter()
-            duplicate_utterance_id = duplicate_recent_final_utterance_id(final_text, final_seen_at)
+            final_audio_span = final_transcript_audio_span(result)
+            duplicate_utterance_id = duplicate_recent_final_utterance_id(final_text, final_audio_span, final_seen_at)
             if duplicate_utterance_id is not None:
+                record_asr_decision(result, final_text, "duplicate_audio_final",
+                                    f"Repeated text over shared audio from utterance {duplicate_utterance_id}")
                 finalized_utterances.add(result.utterance_id)
                 watchdog_close_utterance(
                     result.utterance_id,
@@ -6333,20 +7359,22 @@ def coordinator_worker() -> None:
             revision_cache[result.utterance_id] = revision
             trace_update(result.utterance_id, asr_final_at=final_seen_at)
             partial_cache.pop(result.utterance_id, None)
+            partial_source_spans.pop(result.utterance_id, None)
             partial_display_cache.pop(result.utterance_id, None)
             stable_translation_cache.pop(result.utterance_id, None)
             partial_translation_candidates.pop(result.utterance_id, None)
             stable_locks.pop(result.utterance_id, None)
             watchdog_clear_utterance(result.utterance_id)
             finalized_utterances.add(result.utterance_id)
-            note_recent_final_transcript(result.utterance_id, final_text, final_seen_at)
-            reset_current_partial_state()
+            note_recent_final_transcript(result.utterance_id, final_text, final_audio_span, final_seen_at)
+            reset_current_partial_state(result.utterance_id)
             with ui_lock:
                 ui_set_panel_entry("left", result.utterance_id, "src", f"🗣️ {source_label()}: {color_left_tr(final_text)}", final=True, revision=revision)
                 render_dashboard()
             with session_log_lock:
                 audio_final_transcripts[result.utterance_id] = final_text
-            enqueue_translation_task(
+            record_asr_decision(result, final_text, "accepted_final")
+            translation_accepted = enqueue_translation_task(
                 TranslationTask(
                     source="audio",
                     text=final_text,
@@ -6359,6 +7387,8 @@ def coordinator_worker() -> None:
                     revision=revision,
                 )
             )
+            if translation_accepted is False:
+                record_asr_decision(result, final_text, "translation_rejected", "Final transcript retained; translation was not queued")
             revision_cache.pop(result.utterance_id, None)
         except Exception as exc:
             ui_update(status=f"❌ Coordinator error: {exc}")
@@ -6441,7 +7471,7 @@ def translate_chunk_with_optional_deltas(
     delta_index = 0
     for piece in iter_translate_chunk_mlx_lm(chunk, task.src_lang, forced_bos_id, task.beams):
         pieces.append(piece)
-        accumulated = strip_model_thinking("".join(pieces))
+        accumulated = strip_model_thinking("".join(pieces), final=False)
         if should_emit_mt_delta(accumulated, last_emitted, last_emit_at):
             last_emitted = accumulated
             last_emit_at = time.perf_counter()
@@ -6632,6 +7662,16 @@ def handle_translation_result(result: TranslationResult) -> None:
 
 
 def translation_worker() -> None:
+    global translation_thread_error
+    update_stage_status("translation", "loading", "thread mode; process isolation disabled")
+    try:
+        init_translation_runtime_only()
+        warmup_translation_runtime_only(report=False, strict=True)
+        update_stage_status("translation", "ready", "thread mode")
+    except Exception as exc:
+        translation_thread_error = str(exc)
+        update_stage_status("translation", "failed", translation_thread_error)
+        return
     while not shutdown_event.is_set():
         try:
             item = mt_tasks.get(timeout=0.1)
@@ -6683,18 +7723,23 @@ def mt_process_main(input_q, output_q) -> None:
 
 
 def start_mt_process() -> None:
-    global mt_ipc_ctx, mt_ipc_in, mt_ipc_out, mt_process
-    if mt_process is not None:
+    global translation_stage
+    if translation_stage is not None:
         return
-    mt_ipc_ctx = mp.get_context("spawn")
-    mt_ipc_in = mt_ipc_ctx.Queue(maxsize=max(1, args.mt_queue_size))
-    mt_ipc_out = mt_ipc_ctx.Queue(maxsize=max(8, args.mt_queue_size * 4))
-    mt_process = mt_ipc_ctx.Process(target=mt_process_main, args=(mt_ipc_in, mt_ipc_out), daemon=True)
-    mt_process.start()
+    translation_stage = ProcessStage("translation", initialize_translation_stage, handle_translation_stage_request,
+                                     initargs=(vars(args).copy(),),
+                                     capacity=args.inference_queue_size,
+                                     startup_timeout=args.startup_timeout,
+                                     request_timeout=args.inference_timeout,
+                                     on_event=on_inference_event, on_result=receive_translation_stage_result)
+    translation_stage.start()
 
 
 def stop_mt_process() -> None:
-    global mt_process, mt_ipc_in, mt_ipc_out, mt_ipc_ctx
+    global mt_process, mt_ipc_in, mt_ipc_out, mt_ipc_ctx, translation_stage
+    if translation_stage is not None:
+        translation_stage.close(timeout=2)
+        translation_stage = None
     if mt_ipc_in is not None:
         try:
             mt_ipc_in.put_nowait(None)
@@ -6714,17 +7759,17 @@ def stop_mt_process() -> None:
 
 
 def translation_result_worker() -> None:
-    if mt_ipc_out is None:
-        return
     while not shutdown_event.is_set():
         try:
-            result = mt_ipc_out.get(timeout=0.1)
+            result = translation_stage_results.get(timeout=0.1)
         except Empty:
             continue
         try:
             handle_translation_result(result)
         except Exception as exc:
             ui_update(status=f"❌ Translation result error: {exc}")
+        finally:
+            translation_stage_results.task_done()
 
 
 def tts_worker() -> None:
@@ -6734,10 +7779,7 @@ def tts_worker() -> None:
             task = tts_tasks.get(timeout=0.1)
         except Empty:
             continue
-        tts_playing.set()
-        playback_guard_until = time.time() + (args.playback_guard_ms / 1000.0)
-        with audio_lock:
-            reset_active_capture_state()
+        playback_started = False
         try:
             if task.source == "audio":
                 trace_update(task.utterance_id, tts_start_at=time.perf_counter())
@@ -6745,6 +7787,13 @@ def tts_worker() -> None:
                 log_debug(f"TTS task chars={len(task.text)} wav_out={task.wav_out}")
             engine = tts_best_available(task.text, task.wav_out, lang_hint=task.lang_hint)
             ui_update(status=f"🗣️ TTS engine: {engine} | WAV: {task.wav_out}")
+            # Rendering can be slow. It is not playback, and must not mute or
+            # reset active capture while the WAV is still being synthesized.
+            if not args.duplex_capture:
+                with audio_lock:
+                    reset_active_capture_state()
+            tts_playing.set()
+            playback_started = True
             play_wav(task.wav_out)
             if task.source == "audio":
                 trace_update(task.utterance_id, tts_done_at=time.perf_counter())
@@ -6756,7 +7805,10 @@ def tts_worker() -> None:
         except Exception as exc:
             ui_update(status=f"❌ TTS pipeline error: {exc}")
         finally:
-            playback_guard_until = time.time() + (args.playback_guard_ms / 1000.0)
+            playback_guard_until = (
+                time.time() + (args.playback_guard_ms / 1000.0)
+                if playback_started and not args.duplex_capture else 0.0
+            )
             tts_playing.clear()
             tts_tasks.task_done()
 
@@ -6824,6 +7876,348 @@ def run_self_test() -> int:
             _assert_self_test(queued_utterance_id == utterance_id and not partial, "queued ASR task was not final")
         finally:
             clear_final_asr_pending(utterance_id)
+
+    @check("Ring buffer retains exact newest samples across wraps and large callbacks")
+    def _test_ring_sample_order() -> None:
+        ring = NativeTimestampRingBuffer(0.003, sample_rate=8000)
+        first = np.arange(17, dtype=np.int16)
+        ring.write(0, first)
+        first[:] = -1
+        ring.write(2_125_000, np.arange(17, 40, dtype=np.int16))
+        _assert_self_test(np.array_equal(ring.latest_ms(100), np.arange(16, 40)), "ring wrap lost or reordered retained samples")
+        _assert_self_test(ring.total_samples == 24 and ring.frames[0][0] == 2_000_000, "partial eviction corrupted capacity or first timestamp")
+        ring.write(5_000_000, np.arange(40, 90, dtype=np.int16))
+        _assert_self_test(np.array_equal(ring.latest_ms(100), np.arange(66, 90)), "oversized capture discarded its newest tail")
+        _assert_self_test(np.array_equal(ring.latest_ms(1), np.arange(82, 90)), "ring duration used the global rather than its own sample rate")
+        _assert_self_test(ring.total_samples == 24 and ring.frames[0][0] == 8_250_000, "large capture retention timestamp is wrong")
+
+    @check("Ring scheduler evicts only partials and preserves committed submission order")
+    def _test_ring_scheduler_order() -> None:
+        scheduler = PriorityAsrScheduler()
+        scheduler.q = PriorityQueue(maxsize=4)
+        pcm = np.ones(FRAME_SAMPLES, dtype=np.int16)
+        ids = (101, 202, 303, 404)
+        try:
+            _assert_self_test(scheduler.submit(ids[0], pcm, partial=True), "first partial rejected")
+            _assert_self_test(scheduler.submit(ids[1], pcm, partial=False), "first final rejected")
+            _assert_self_test(scheduler.submit(ids[2], pcm, partial=True), "second partial rejected")
+            _assert_self_test(scheduler.submit(ids[3], pcm, partial=False), "second final rejected")
+            _assert_self_test(scheduler.submit(ids[0], pcm, partial=False), "promoted final rejected")
+            _assert_self_test(scheduler.q.qsize() == 4, "promotion changed unrelated queue entries")
+            _assert_self_test(scheduler._drop_one_queued_partial(), "remaining speculative task was not evicted")
+            queued = []
+            while not scheduler.q.empty():
+                item = scheduler.q.get_nowait()
+                queued.append((item[2], item[3]))
+                scheduler.q.task_done()
+            _assert_self_test(queued == [(202, False), (404, False), (101, False)], "committed finals were lost or reordered during partial eviction")
+            _assert_self_test(scheduler.q.unfinished_tasks == 0, "eviction broke queue completion accounting")
+        finally:
+            for utterance_id in ids:
+                clear_final_asr_pending(utterance_id)
+
+    @check("Ring ingress assembles variable callbacks with ordered ADC timestamps")
+    def _test_ring_ingress_callbacks() -> None:
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        class _Endpoint:
+            def __init__(self):
+                self.events = []
+            def on_frame(self, timestamp_ns, pcm):
+                self.events.append((timestamp_ns, pcm.copy()))
+            def finalize(self, force=False):
+                self.events.append("final")
+
+        endpoint = _Endpoint()
+        errors = []
+        with patch.dict(globals(), {"shutdown_event": threading.Event(), "ui_update": lambda **kw: errors.append(kw)}):
+            feeder = RingAudioFeeder(endpoint, queue_ms=200, clock_ns=lambda: 10_100_000_000)
+            offset = 0
+            for count in (113, 527, 800, 17, 143):
+                pcm = np.arange(offset, offset + count, dtype=np.int16).reshape(-1, 1)
+                jitter = 0.001 if offset else 0.0
+                time_info = SimpleNamespace(inputBufferAdcTime=1.0 + offset / SAMPLE_RATE + jitter, currentTime=1.1 + offset / SAMPLE_RATE + jitter)
+                feeder.callback(pcm, count, time_info, None)
+                pcm[:] = -1  # capture buffers are reused as soon as callbacks return.
+                offset += count
+            packets = list(feeder.queue)
+            _assert_self_test([packet.sequence for packet in packets] == list(range(5)), "callback splitting reordered frame sequence")
+            _assert_self_test([packet.timestamp_ns for packet in packets] == [10_000_000_000 + n * 20_000_000 for n in range(5)], "ADC timestamps drifted across callback boundaries")
+            feeder.request_finalize()
+            feeder.close()
+            feeder.worker()
+            audio = [event[1] for event in endpoint.events if isinstance(event, tuple)]
+            _assert_self_test(np.array_equal(np.concatenate(audio), np.arange(1600, dtype=np.int16)), "variable callbacks lost, duplicated, or retained mutable samples")
+            _assert_self_test(endpoint.events[-1] == "final" and not errors, "ordered final boundary was lost or clean capture reported an error")
+
+    @check("Forced ring flush owns its partial frame without leaking audio across utterances")
+    def _test_ring_ingress_flush_partial_frame() -> None:
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        class _Scheduler:
+            def __init__(self):
+                self.finals = []
+            def submit(self, utterance_id, pcm, partial):
+                _assert_self_test(not partial, "short forced utterance unexpectedly submitted a partial")
+                self.finals.append((utterance_id, pcm.copy()))
+                return True
+
+        class _Gate:
+            def detect(self, pcm):
+                _assert_self_test(pcm.size == FRAME_SAMPLES, "VAD received a truncated control frame")
+                return True, -20.0, 1.0
+
+        saved_partial = {key: value for key, value in globals().items() if key.startswith("current_partial_")}
+        scheduler = _Scheduler()
+        notices = []
+        try:
+            with patch.dict(globals(), {
+                "shutdown_event": threading.Event(), "tts_playing": threading.Event(),
+                "ui_update": lambda **kw: notices.append(kw), "latency_traces": {}, "inflight_partial_markers": {},
+            }):
+                endpoint = RingEndpointDetector(NativeTimestampRingBuffer(1), scheduler)
+                endpoint.vad_gate = _Gate()
+                feeder = RingAudioFeeder(endpoint, queue_ms=200, clock_ns=lambda: 10_100_000_000)
+                feeder.callback(np.arange(100, dtype=np.int16), 100,
+                                SimpleNamespace(inputBufferAdcTime=1.0, currentTime=1.1), None)
+                feeder.request_finalize()
+                feeder.callback(np.arange(100, 420, dtype=np.int16), 320,
+                                SimpleNamespace(inputBufferAdcTime=1.00625, currentTime=1.10625), None)
+                packets = [item for item in feeder.queue if item is not None]
+                _assert_self_test([packet.valid_samples for packet in packets] == [100, 320], "forced flush left pre-barrier samples in live carry")
+                _assert_self_test([packet.timestamp_ns for packet in packets] == [10_000_000_000, 10_006_250_000], "forced flush inserted synthetic time between captured samples")
+                feeder.close()
+                feeder.worker()
+                _assert_self_test(len(scheduler.finals) == 2, "forced flush failed to split the two captured utterances")
+                _assert_self_test(np.array_equal(scheduler.finals[0][1], np.arange(100, dtype=np.int16)), "pre-flush tail was lost, padded into ASR, or joined to later speech")
+                _assert_self_test(np.array_equal(scheduler.finals[1][1], np.arange(100, 420, dtype=np.int16)), "post-flush speech inherited earlier samples")
+                _assert_self_test(np.array_equal(endpoint.ring.latest_ms(1000), np.arange(420, dtype=np.int16)), "ring history contains synthetic flush padding or reordered samples")
+                _assert_self_test(not notices, f"healthy forced flush produced capture errors: {notices}")
+        finally:
+            globals().update(saved_partial)
+
+    @check("Ring ingress bounds large callbacks and reports sequence gaps before later audio")
+    def _test_ring_ingress_drops() -> None:
+        from unittest.mock import patch
+
+        class _Endpoint:
+            def __init__(self):
+                self.events = []
+            def on_frame(self, timestamp_ns, pcm):
+                self.events.append((timestamp_ns, pcm.copy()))
+            def finalize(self, force=False):
+                self.events.append("final")
+
+        endpoint = _Endpoint()
+        notices = []
+        with patch.dict(globals(), {"shutdown_event": threading.Event(), "ui_update": lambda **kw: notices.append(kw)}):
+            feeder = RingAudioFeeder(endpoint, queue_ms=40, clock_ns=lambda: 1_000_000_000)
+            pcm = np.arange(5 * FRAME_SAMPLES + 7, dtype=np.int16)
+            feeder.callback(pcm, pcm.size, None, None)
+            _assert_self_test(feeder.queued_frames == 2 and len(feeder.pending) == 7, "large callback exceeded the queue/sample carry budget")
+            _assert_self_test([packet.sequence for packet in feeder.queue] == [3, 4], "large callback did not retain newest frames in order")
+            feeder.close()  # Final seven real samples are retained; VAD-only padding never enters ASR/history.
+            _assert_self_test(feeder.dropped_frames == 4 and feeder.dropped_samples == 4 * FRAME_SAMPLES, "queue eviction was not counted exactly")
+            feeder.worker()
+            audio = [event for event in endpoint.events if isinstance(event, tuple)]
+            _assert_self_test(endpoint.events[0] == "final", "missing capture sequences were silently joined to the previous utterance")
+            _assert_self_test(np.array_equal(np.concatenate([event[1] for event in audio]), pcm[1280:]), "large callback tail was lost, padded, or reordered")
+            _assert_self_test(audio[-1][1].size == 7 and audio[1][0] - audio[0][0] == 20_000_000, "stopped sub-frame extent/timestamp is incorrect")
+            _assert_self_test(len(notices) == 1 and "dropped=4 frames/1280 samples" in notices[0]["status"], "capture overflow was not reported")
+
+    @check("Ring ingress separates device overruns and clock resets without repeated gaps")
+    def _test_ring_ingress_overruns() -> None:
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        class _Endpoint:
+            def __init__(self):
+                self.events = []
+            def on_frame(self, timestamp_ns, pcm):
+                self.events.append((timestamp_ns, int(pcm[0])))
+            def finalize(self, force=False):
+                self.events.append("final")
+
+        endpoint = _Endpoint()
+        notices = []
+        with patch.dict(globals(), {"shutdown_event": threading.Event(), "ui_update": lambda **kw: notices.append(kw)}):
+            feeder = RingAudioFeeder(endpoint, queue_ms=200, clock_ns=lambda: 10_100_000_000)
+            def send(count, value, adc, status=None):
+                feeder.callback(np.full((count, 1), value, dtype=np.int16), count,
+                                SimpleNamespace(inputBufferAdcTime=adc, currentTime=adc + 0.1), status)
+            send(320, 1, 1.0)
+            send(100, 2, 1.02)
+            send(160, 3, 1.04, SimpleNamespace(input_overflow=True))
+            send(160, 3, 1.05)
+            send(320, 4, 0.5)  # PortAudio clock reset: re-anchor once and keep timestamps monotonic.
+            send(320, 5, 0.52)
+            packets = list(feeder.queue)
+            _assert_self_test([packet.discontinuity for packet in packets] == [False, True, True, False], "overrun/reset boundary was lost or repeated on healthy callbacks")
+            _assert_self_test([int(packet.pcm[0]) for packet in packets] == [1, 3, 4, 5], "incomplete audio crossed a capture discontinuity")
+            _assert_self_test(feeder.dropped_samples == 100 and feeder.input_overruns == 1, "overrun carry loss was not counted")
+            _assert_self_test([packet.timestamp_ns for packet in packets] == [10_000_000_000, 10_040_000_000, 10_060_000_000, 10_080_000_000], "clock reset caused overlapping or reversed capture timestamps")
+            feeder.close()
+            feeder.worker()
+            _assert_self_test(endpoint.events == [(10_000_000_000, 1), "final", (10_040_000_000, 3), "final", (10_060_000_000, 4), (10_080_000_000, 5), "final"], "device gaps were not finalized before later audio")
+            _assert_self_test(notices and "input overruns=1" in notices[0]["status"], "device overrun was not surfaced")
+
+    @check("Ring ingress preserves flush barriers and bounded controls during repeated eviction")
+    def _test_ring_ingress_flush_and_close() -> None:
+        from unittest.mock import patch
+
+        class _Endpoint:
+            def __init__(self):
+                self.events = []
+            def on_frame(self, timestamp_ns, pcm):
+                self.events.append(int(pcm[0]))
+            def finalize(self, force=False):
+                self.events.append("final")
+
+        endpoint = _Endpoint()
+        with patch.dict(globals(), {"shutdown_event": threading.Event(), "ui_update": lambda **kw: None}):
+            feeder = RingAudioFeeder(endpoint, queue_ms=40, clock_ns=lambda: 1_000_000_000)
+            for value in range(20):
+                feeder.callback(np.full(FRAME_SAMPLES, value, dtype=np.int16), FRAME_SAMPLES, None, None)
+                feeder.request_finalize()
+                feeder.request_finalize()
+            _assert_self_test(len(feeder.queue) <= 2 * feeder.max_frames + 1, "flush controls grew beyond the bounded audio queue")
+            feeder.close()
+            feeder.callback(np.full(FRAME_SAMPLES, 999, dtype=np.int16), FRAME_SAMPLES, None, None)
+            feeder.worker()
+            _assert_self_test([event for event in endpoint.events if event != "final"] == [18, 19], "close accepted later callbacks or reordered retained audio")
+            _assert_self_test(endpoint.events[-4:] == [18, "final", 19, "final"], "manual finalization overtook an earlier frame")
+
+    @check("Ring capture callback stays independent of a stalled worker and closes cleanly")
+    def _test_ring_ingress_worker_lifecycle() -> None:
+        from unittest.mock import patch
+        entered, release = threading.Event(), threading.Event()
+
+        class _Endpoint:
+            def __init__(self):
+                self.frames = []
+                self.threads = []
+            def on_frame(self, timestamp_ns, pcm):
+                self.threads.append(threading.get_ident())
+                self.frames.append(int(pcm[0]))
+                if len(self.frames) == 1:
+                    entered.set()
+                    _assert_self_test(release.wait(timeout=2), "test worker release timed out")
+            def finalize(self, force=False):
+                pass
+
+        endpoint = _Endpoint()
+        notices = []
+        with patch.dict(globals(), {"shutdown_event": threading.Event(), "ui_update": lambda **kw: notices.append(kw)}):
+            feeder = RingAudioFeeder(endpoint, queue_ms=40, clock_ns=lambda: 1_000_000_000)
+            try:
+                with feeder:
+                    feeder.callback(np.zeros(FRAME_SAMPLES, dtype=np.int16), FRAME_SAMPLES, None, None)
+                    _assert_self_test(entered.wait(timeout=1), "capture worker did not receive a frame")
+                    for value in range(1, 7):
+                        feeder.callback(np.full(FRAME_SAMPLES, value, dtype=np.int16), FRAME_SAMPLES, None, None)
+                    _assert_self_test(feeder.dropped_frames == 4, "stalled worker did not enforce the capture budget")
+                    release.set()
+            finally:
+                release.set()
+                feeder.close()
+            _assert_self_test(feeder.worker_thread is not None and not feeder.worker_thread.is_alive(), "capture worker failed to exit after source shutdown")
+            _assert_self_test(endpoint.frames == [0, 5, 6], "stalled worker reordered or duplicated retained audio")
+            _assert_self_test(all(ident != threading.get_ident() for ident in endpoint.threads), "endpoint work ran on the capture callback thread")
+            _assert_self_test(notices and "dropped=4 frames/1280 samples" in notices[0]["status"], "live worker failed to report its overrun")
+
+    @check("Selected SoundDevice inputs resolve numeric indexes and bypass native auto capture")
+    def _test_sounddevice_input_selection() -> None:
+        from unittest.mock import patch
+        with patch.object(args, "audio_io", "auto"), patch.object(args, "input_device", "17"):
+            _assert_self_test(resolve_audio_io_backend() == "sounddevice" and sounddevice_input_device() == 17, "numeric device selection was ignored or treated as a name")
+        with patch.object(args, "input_device", "LitLink Audio"):
+            _assert_self_test(sounddevice_input_device() == "LitLink Audio", "named virtual audio source was changed")
+
+    @check("Ring endpoint includes each onset frame exactly once")
+    def _test_ring_onset_sequence() -> None:
+        from unittest.mock import patch
+        saved_partial = {key: value for key, value in globals().items() if key.startswith("current_partial_")}
+        try:
+            with patch.dict(globals(), {"tts_playing": threading.Event()}):
+                endpoint = RingEndpointDetector(NativeTimestampRingBuffer(1), PriorityAsrScheduler())
+                before = np.full(FRAME_SAMPLES, 11, dtype=np.int16)
+                onset = np.full(FRAME_SAMPLES, 22, dtype=np.int16)
+                endpoint._consume(TimestampedAudioFrame(before, 0, -60.0, False))
+                endpoint._consume(TimestampedAudioFrame(onset, 20_000_000, -20.0, True))
+                _assert_self_test(np.array_equal(np.concatenate(endpoint.active), np.concatenate([before, onset])), "speech-onset frame was duplicated or reordered")
+                _assert_self_test(current_partial_utterance_id == endpoint.utterance_id, "new capture did not own endpoint partial context")
+        finally:
+            globals().update(saved_partial)
+
+    @check("Coordinator ignores closed partials without erasing newer utterance context")
+    def _test_coordinator_interleaving() -> None:
+        from copy import deepcopy
+        from unittest.mock import patch
+        stop = threading.Event()
+
+        class _FiniteResults(Queue):
+            def task_done(self):
+                super().task_done()
+                if self.unfinished_tasks == 0:
+                    stop.set()
+
+        results = _FiniteResults()
+        for utterance_id, text, partial in [
+            (10, "final ten", False), (20, "future twenty", True),
+            (10, "late closed ten", True), (5, "earlier final five", False),
+            (30, "newest thirty", True), (20, "older twenty revision", True),
+            (20, "final twenty", False), (20, "late closed twenty", True),
+            (40, "", False), (40, "late empty-final forty", True),
+            (50, "racing fifty", True),
+        ]:
+            results.put_nowait(AsrResult(utterance_id, text, partial))
+        translated: list[TranslationTask] = []
+        errors: list[dict] = []
+        state = deepcopy(ui_state)
+        state.update(left_active={}, left_order=[], left_done=[])
+
+        def sanitize_with_capture_interleaving(text: str, final: bool = False) -> str:
+            if text == "racing fifty":
+                _assert_self_test(
+                    current_partial_utterance_id == 30 and current_partial_text == "newest thirty",
+                    "older results erased or replaced future partial context",
+                )
+                # A newer capture can start while the coordinator prepares an
+                # older ASR result; admission must be rechecked at publication.
+                reset_current_partial_state(next_utterance_id=60)
+            return text
+
+        replacement = {
+            "asr_results": results, "shutdown_event": stop, "ui_state": state,
+            "render_dashboard": lambda: None, "ui_update": lambda **kw: errors.append(kw),
+            "enqueue_translation_task": translated.append,
+            "sanitize_asr_text": sanitize_with_capture_interleaving,
+            "prepare_final_transcript_for_translation": lambda text, previous: text,
+            "forced_bos_for_target": lambda target: 1,
+            "audio_final_transcripts": {}, "latency_traces": {}, "inflight_partial_markers": {},
+            "ring_endpoint": None, "current_partial_utterance_id": None,
+        }
+        saved_partial = {key: value for key, value in globals().items() if key.startswith("current_partial_")}
+        try:
+            with ExitStack() as stack:
+                stack.enter_context(patch.dict(globals(), replacement))
+                stack.enter_context(patch.object(args, "stream_audio_translation", False))
+                stack.enter_context(patch.object(args, "partial_display_policy", "latest"))
+                stack.enter_context(patch.object(args, "final_dedupe_window_ms", 0))
+                stack.enter_context(patch.object(args, "empty_final_action", "close"))
+                coordinator_worker()
+                _assert_self_test(not errors, f"coordinator raised errors: {errors}")
+                _assert_self_test([task.utterance_id for task in translated] == [10, 5, 20], "committed earlier/future IDs were dropped or reordered")
+                _assert_self_test(state["left_active"][10]["src_final"] and "late" not in str(state["left_active"][10]["src"]), "late partial reopened finalized ten")
+                _assert_self_test(state["left_active"][20]["src_final"] and "late" not in str(state["left_active"][20]["src"]), "late partial reopened finalized twenty")
+                _assert_self_test(40 not in state["left_active"], "late partial reopened a closed empty final")
+                _assert_self_test(30 in state["left_active"], "newer partial UI entry was lost")
+                _assert_self_test(current_partial_utterance_id == 60 and not current_partial_text, "older result overwrote capture that started during result preparation")
+                _assert_self_test(results.unfinished_tasks == 0, "coordinator failed to acknowledge an ignored result")
+        finally:
+            globals().update(saved_partial)
 
     @check("TTS queue preserves typed speech")
     def _test_tts_queue() -> None:
@@ -6961,14 +8355,17 @@ def run_self_test() -> int:
         _assert_self_test(cleaned.casefold().count("diş hekimliği") == 1, "overlapping ASR repeat was not collapsed")
         _assert_self_test("randevunuzu hatırlatırız" in cleaned, "repeat cleanup dropped the useful suffix")
 
-    @check("Near-duplicate finals are detected across endpoint bounce")
+    @check("Final dedupe preserves corrections and requires shared audio")
     def _test_near_duplicate_final_detection() -> None:
         old_ratio = args.final_dedupe_contained_ratio
         try:
             args.final_dedupe_contained_ratio = 0.78
             first = "لا إله إلا الله وحده لا شريك له حمده على كل شيء"
             second = "لا إله إلا إنه الله وحده لا شريك له وله له المذكور الحمد يحيى يوم يعد بيد الخير وهو على كل شيء لشيء قدير"
-            _assert_self_test(final_transcripts_are_near_duplicates(first, second), "Arabic endpoint-bounce duplicate was not detected")
+            _assert_self_test(not final_transcripts_are_near_duplicates(first, second), "different decoded words were treated as duplicate speech")
+            _assert_self_test(final_transcripts_are_near_duplicates(first, first), "exact repeated transcript was not recognized")
+            _assert_self_test(not final_transcript_audio_spans_overlap(None, None), "missing audio provenance suppressed a repeated phrase")
+            _assert_self_test(not final_transcript_audio_spans_overlap(("session", "AR", 0, 100), ("session", "AR", 200, 300)), "disjoint source intervals were treated as duplicates")
             _assert_self_test(
                 not final_transcripts_are_near_duplicates("مرحبا كيف حالك اليوم", "أريد حجز موعد جديد"),
                 "unrelated Arabic finals were treated as duplicates",
@@ -7143,6 +8540,56 @@ def run_self_test() -> int:
         finally:
             args.mt_prompt = old_prompt
 
+    @check("MLX prompt selects TranslateGemma direction schema and preserves generic templates")
+    def _test_mlx_translation_prompt_model_contract() -> None:
+        class _FakeTokenizer:
+            def __init__(self):
+                self.messages = None
+
+            # This deliberately omits enable_thinking to exercise the existing
+            # compatibility retry used with tokenizers that reject that option.
+            def apply_chat_template(self, messages, *, add_generation_prompt, tokenize):
+                _assert_self_test(add_generation_prompt and not tokenize, "incorrect prompt serialization options")
+                self.messages = messages
+                return "formatted-prompt"
+
+        saved = {name: globals()[name] for name in (
+            "mlx_translation_tokenizer", "USER_SET_TRANSLATION_MODEL", "ID_BY_LANG_CODE",
+        )}
+        old_model, old_prompt = args.translation_model, args.mt_prompt
+        fake = _FakeTokenizer()
+        globals()["mlx_translation_tokenizer"] = fake
+        globals()["USER_SET_TRANSLATION_MODEL"] = True
+        globals()["ID_BY_LANG_CODE"] = {code: index + 11 for index, code in enumerate(LANGUAGE_SPECS)}
+        try:
+            args.translation_model = "/models/translategemma-12b-it-4bit"
+            args.mt_prompt = "Generic wrapper must not enter the specialized translation content: {text}"
+            text = "  שלום 123، مرحباً\nCafé, İstanbul, Москва  "
+            for source_code in ("AR", "HE", "DE", "TR", "FR", "RU"):
+                for target_code in ("AR", "HE", "DE", "TR", "FR", "RU"):
+                    if source_code == target_code:
+                        continue
+                    formatted = mlx_translation_prompt(
+                        text, language_spec(source_code).nllb, ID_BY_LANG_CODE[target_code],
+                    )
+                    expected = [{"role": "user", "content": [{
+                        "type": "text", "source_lang_code": language_spec(source_code).whisper,
+                        "target_lang_code": language_spec(target_code).whisper, "text": text,
+                    }]}]
+                    _assert_self_test(formatted == "formatted-prompt" and fake.messages == expected,
+                                      f"TranslateGemma direction/text corrupted for {source_code}->{target_code}")
+
+            args.translation_model = "mlx-community/Meta-Llama-3.1-8B-Instruct-4bit"
+            args.mt_prompt = "Use formal {target_language}: {text}"
+            mlx_translation_prompt(text, language_spec("AR").nllb, ID_BY_LANG_CODE["HE"])
+            _assert_self_test(fake.messages == [
+                {"role": "system", "content": "You are a strict real-time translator. Output only the requested target-language translation with no commentary, no quotes, and no extra notes."},
+                {"role": "user", "content": f"Use formal Hebrew: {text}"},
+            ], "generic custom template changed during TranslateGemma integration")
+        finally:
+            globals().update(saved)
+            args.translation_model, args.mt_prompt = old_model, old_prompt
+
     @check("Final ASR merge preserves partial details")
     def _test_final_merge_preserves_partial_details() -> None:
         old_merge = args.final_merge_last_partial
@@ -7190,8 +8637,148 @@ def run_self_test() -> int:
 # ======================
 # Main loop
 # ======================
+def web_state_snapshot() -> dict:
+    from tts_runtime.web_transport import build_web_snapshot
+    return build_web_snapshot(ui_state, {
+        "source_language": source_language_code(), "target_language": target_language_code(),
+        "input_device": args.input_device, "debug": args.debug, "mode": args.mode,
+        "audio_review": args.audio_review,
+    }, session_id=runtime_session_id, running=not shutdown_event.is_set(),
+        audio_review_mode=audio_review_mode, recording_directory=str(runtime_audio_dir or ""))
+
+
+def mark_audio_for_review(reason: str = "user_flagged") -> bool:
+    if audio_evidence is None or ring_endpoint is None:
+        return False
+    ring = ring_endpoint.ring
+    remaining = SAMPLE_RATE * 15
+    chunks, start_ns, end_ns = [], None, None
+    with ring.lock:
+        for timestamp_ns, samples in reversed(ring.frames):
+            frame_end = timestamp_ns + int(samples.size) * 1_000_000_000 // SAMPLE_RATE
+            if start_ns is not None and abs(frame_end - start_ns) > 2 * 1_000_000_000 // SAMPLE_RATE:
+                break  # Never join two disjoint recording intervals for review.
+            take = min(remaining, int(samples.size))
+            chunks.append(samples[-take:].copy())
+            start_ns = timestamp_ns + (int(samples.size) - take) * 1_000_000_000 // SAMPLE_RATE
+            end_ns = frame_end if end_ns is None else end_ns
+            remaining -= take
+            if remaining <= 0:
+                break
+    if not chunks:
+        return False
+    pcm = np.concatenate(list(reversed(chunks)))
+    return audio_evidence.save_clip(pcm, {"session_id": runtime_session_id,
+                                          "source_language": source_language_code(),
+                                          "timestamp_start_ns": start_ns, "timestamp_end_ns": end_ns,
+                                          "selection": "newest contiguous interval, up to 15 seconds"},
+                                    [reason], label="manual-review", timestamp_ns=start_ns)
+
+
+def publish_selection_result(result: SelectionResult) -> None:
+    with selection_tasks_lock:
+        expected = selection_tasks.get(result.task.lookup_id)
+        if expected != result.task or result.task.session_id != runtime_session_id:
+            return
+        selection_tasks.pop(result.task.lookup_id, None)
+    if headless_transport is not None:
+        headless_transport.send_packet({"type": "lookup_result", "lookup_id": result.task.lookup_id,
+            "selection_id": result.task.selection_id, "source_language": result.task.source_language,
+            "target_language": result.task.target_language,
+            "translation": clean_model_output(result.translation), "error": str(result.error)[:1000]})
+
+
+def fail_selection_task(identity: str, error: str) -> None:
+    with selection_tasks_lock:
+        task = selection_tasks.get(identity)
+    if task is not None:
+        publish_selection_result(SelectionResult(task, error=error))
+
+
+def submit_selection_task(command: dict) -> dict:
+    if translation_stage is None or translation_stage.state not in {"loading", "ready", "busy"}:
+        return {"accepted": False, "message": "Start a session with an available translation worker first"}
+    task = SelectionTask.from_command(command, runtime_session_id)
+    with selection_tasks_lock:
+        if len(selection_tasks) >= 4 or task.lookup_id in selection_tasks:
+            return {"accepted": False, "message": "Selection translation is busy; wait or select again shortly"}
+        selection_tasks[task.lookup_id] = task
+    accepted = translation_stage.submit(task, background=True, key=("lookup", task.lookup_id))
+    if not accepted:
+        fail_selection_task(task.lookup_id, "Live work takes priority; select the phrase again shortly")
+    return {"accepted": accepted, "message": "Selection queued" if accepted else "Translation is busy"}
+
+
+def process_headless_action(command: dict) -> dict:
+    action = command.get("action")
+    if action == "lookup":
+        return submit_selection_task(command)
+    if action == "reply":
+        text = command.get("text", "")
+        if not isinstance(text, str) or not text.strip() or len(text) > 10000:
+            return {"accepted": False, "message": "Enter a reply of 1–10000 characters"}
+        accepted = submit_typed_reply(text)
+        return {"accepted": accepted, "message": "Queued" if accepted else "Translation unavailable or queue full; draft retained"}
+    if action == "flush":
+        if active_ring_feeder is not None:
+            active_ring_feeder.request_finalize()
+        else:
+            force_flush_audio()
+        return {"accepted": True, "message": "Audio flush requested"}
+    if action == "mark":
+        accepted = mark_audio_for_review(str(command.get("reason") or "user_flagged"))
+        return {"accepted": accepted, "message": "Review clip queued" if accepted else "No captured audio available or audio review is disabled/full"}
+    if action == "stop":
+        return {"accepted": True, "message": "Stopping", "stop": True}
+    return {"accepted": False, "message": "Unknown command"}
+
+
+def read_headless_command(timeout: float) -> str | None:
+    if headless_transport is not None and headless_transport.poll(timeout):
+        if headless_transport.snapshot.get("output_failed"):
+            raise RuntimeError("Web output channel stalled, overflowed or failed; restart the session after reconnecting")
+        shutdown_event.set()
+        return "\x1b"
+    return None
+
+
+def run_web_interface() -> int:
+    from tts_runtime.web_controller import WebController
+    from tts_runtime.web_server import WebInterface
+    excluded = {"--ui", "--web-host", "--web-port", "--source-language", "--target-language", "--input-device", "--audio-review"}
+    forwarded = []
+    tokens = iter(sys.argv[1:])
+    for token in tokens:
+        flag = token.split("=", 1)[0]
+        if flag == "--debug":
+            continue
+        if flag in excluded:
+            if "=" not in token:
+                next(tokens, None)
+            continue
+        forwarded.append(token)
+    controller = WebController(core_path=Path(__file__).resolve(), python_executable=sys.executable,
+                               core_arguments=forwarded,
+                               initial_config={"source_language": source_language_code(),
+                                               "target_language": target_language_code(),
+                                               "input_device": args.input_device, "debug": args.debug,
+                                               "audio_review": args.audio_review})
+    server = WebInterface(controller, host=args.web_host, port=args.web_port)
+    try:
+        url = server.start()
+        eprint(f"Live TTS web UI: {url}")
+        eprint("Keep this process running; open the URL and choose Start. Ctrl-C stops the local server.")
+        while True:
+            time.sleep(0.25)
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        controller.close()
+        server.close()
+
+
 def main() -> int:
-    global audio_bridge, text_entry_seq
+    global audio_bridge, text_entry_seq, detected_stt_backend, detected_stt_device, active_ring_feeder
     if args.self_test:
         return run_self_test()
     if args.list_devices:
@@ -7202,25 +8789,23 @@ def main() -> int:
         eprint(json.dumps(effective_config(), indent=2, sort_keys=True))
         return 0
 
+    if args.ui == "web":
+        return run_web_interface()
+
     validate_runtime_configuration()
+    initialize_session_runtime()
 
     if args.mode in {"audio", "both"}:
         ensure_audio_runtime()
 
     streaming_engine = resolve_streaming_engine() if args.mode in {"audio", "both"} else "legacy"
-    if args.mt_process:
-        init_parent_routing_runtime()
-        warmup_vad_runtime_only(report=True)
-        start_mt_process()
-    else:
-        init_models()
-        warmup_models()
+    # Resolve metadata only. Every heavy model import/load/warmup belongs to
+    # its worker, after terminal setup; capture and keyboard never wait for it.
+    init_parent_routing_runtime()
     if args.mode in {"audio", "both"}:
-        if streaming_engine == "ring":
-            init_stt_runtime_only()
-            warmup_stt_runtime_only(report=True)
-        else:
-            start_asr_process()
+        detected_stt_backend = resolve_stt_backend()
+        detected_stt_device = resolve_stt_device(detected_stt_backend)
+        args.whisper_model = default_whisper_model_for_backend(detected_stt_backend)
     setup_terminal()
 
     workers: list[threading.Thread] = []
@@ -7229,12 +8814,10 @@ def main() -> int:
         if streaming_engine == "ring":
             ring_scheduler = PriorityAsrScheduler()
             ring_endpoint = RingEndpointDetector(NativeTimestampRingBuffer(args.ring_buffer_seconds), ring_scheduler)
-            workers.append(threading.Thread(target=ring_scheduler.worker, daemon=True))
             workers.append(threading.Thread(target=coordinator_worker, daemon=True))
         else:
             workers.append(threading.Thread(target=audio_frame_worker, daemon=True))
             workers.append(threading.Thread(target=asr_worker, daemon=True))
-            workers.append(threading.Thread(target=asr_result_worker, daemon=True))
             workers.append(threading.Thread(target=coordinator_worker, daemon=True))
     if args.mt_process:
         workers.append(threading.Thread(target=translation_result_worker, daemon=True))
@@ -7256,19 +8839,37 @@ def main() -> int:
     if args.session_logs:
         mode_lines.append(f"📝 Session logs ON: {args.transcription_log}, {args.tts_log} (--no-session-logs disables)")
     init_dashboard(mode_lines)
+    ui_update(status=f"Audio review: {audio_review_mode} | {runtime_audio_dir or 'disabled'} | Ctrl-R saves a review clip")
 
     text_buffer = ""
+    ring_feeder: RingAudioFeeder | None = None
+    last_capture_status_at = 0.0
 
     try:
+        if args.mode in {"audio", "both"}:
+            start_asr_stage()
+        else:
+            update_stage_status("capture", "off", "typed replies only")
+            update_stage_status("asr", "off")
+        if args.mt_process:
+            start_mt_process()
         if args.mode in {"audio", "both"}:
             audio_backend = resolve_audio_io_backend()
             log_verbose(f"audio backend: {audio_backend} | streaming engine: {streaming_engine}")
 
             def handle_interactive_key(timeout: float = 0.0) -> bool:
-                nonlocal text_buffer
+                nonlocal text_buffer, last_capture_status_at
                 global text_entry_seq
+                now = time.monotonic()
+                if ring_feeder is not None and now - last_capture_status_at >= 0.5:
+                    last_capture_status_at = now
+                    update_capture_status(ring_feeder)
                 key = read_key(timeout)
                 if key is None:
+                    return True
+                if key == "\x12":
+                    saved = mark_audio_for_review()
+                    ui_update(status="Review clip queued" if saved else "No audio available for review or recording disabled/full")
                     return True
                 if key == "\x1b":
                     if text_buffer:
@@ -7279,30 +8880,11 @@ def main() -> int:
                     return False
                 if key in ("\n", "\r"):
                     if text_buffer.strip():
-                        text = normalize_text(text_buffer)
-                        text_entry_seq += 1
-                        entry_id = text_entry_seq
-                        with ui_lock:
-                            ui_set_panel_entry("right", entry_id, "src", f"⌨️ {target_label()}: {color_right_en(text)}", final=True)
-                            ui_state["input"] = ""
-                            render_dashboard()
-                        with session_log_lock:
-                            typed_input_texts[entry_id] = text
-                        enqueue_translation_task(
-                            TranslationTask(
-                                source="text",
-                                text=text,
-                                src_lang=target_nllb_lang(),
-                                beams=max(1, args.mt_beams),
-                                target_lang=source_language_code(),
-                                forced_bos_id=forced_bos_for_target(source_language_code()),
-                                utterance_id=entry_id,
-                            )
-                        )
-                        text_buffer = ""
+                        if submit_typed_reply(text_buffer):
+                            text_buffer = ""
                     else:
-                        if streaming_engine == "ring" and ring_endpoint is not None:
-                            ring_endpoint.finalize(force=True)
+                        if streaming_engine == "ring" and ring_feeder is not None:
+                            ring_feeder.request_finalize()
                         else:
                             force_flush_audio()
                         ui_update(status="🎙️ Forced audio flush.")
@@ -7318,21 +8900,38 @@ def main() -> int:
                 return True
 
             if streaming_engine == "ring":
-                if audio_backend not in {"apple-raw", "apple-vpio"}:
-                    raise RuntimeError("ring streaming engine currently requires --audio-io apple-vpio or apple-raw")
-                bridge_mode = "raw" if audio_backend == "apple-raw" else "vpio"
                 if ring_endpoint is None:
                     raise RuntimeError("ring endpoint was not initialized")
-                feeder = RingAppleVPIOFeeder(ring_endpoint)
-                preferred_modes = ("raw",) if audio_backend == "apple-raw" else ("vpio", "raw")
-                with AppleVPIOBridge(feeder.callback, preferred_modes=preferred_modes) as ctx:
-                    audio_bridge = ctx  # same bridge handles playback via stdin
-                    ui_update(status=f"🎙️ apple_vpio_bridge IO active | mode={ctx.mode} | ring scheduler ON")
-                    while True:
-                        if shutdown_event.is_set():
-                            break
-                        if not handle_interactive_key(0.05):
-                            break
+                with RingAudioFeeder(ring_endpoint) as feeder:
+                    ring_feeder = feeder
+                    active_ring_feeder = feeder
+                    if audio_backend in {"apple-raw", "apple-vpio"}:
+                        preferred_modes = ("raw",) if audio_backend == "apple-raw" else ("vpio", "raw")
+                        audio_ctx = AppleVPIOBridge(feeder.callback, preferred_modes=preferred_modes)
+                    else:
+                        audio_ctx = sd.InputStream(
+                            samplerate=SAMPLE_RATE,
+                            channels=CHANNELS,
+                            dtype=DTYPE,
+                            blocksize=FRAME_SAMPLES,
+                            device=sounddevice_input_device(),
+                            callback=feeder.callback,
+                        )
+                    with audio_ctx as ctx:
+                        if audio_backend in {"apple-raw", "apple-vpio"}:
+                            audio_bridge = ctx  # same bridge handles playback via stdin
+                            capture_label = f"apple_vpio_bridge mode={ctx.mode}"
+                        else:
+                            capture_label = f"SoundDevice input={sounddevice_input_device()!r}"
+                        ui_update(status=f"🎙️ {capture_label} | ordered ring scheduler ON")
+                        update_stage_status("capture", "listening", capture_label)
+                        while True:
+                            if shutdown_event.is_set():
+                                break
+                            if not handle_interactive_key(0.05):
+                                break
+                ring_feeder = None
+                active_ring_feeder = None
             else:
                 if audio_backend in {"apple-raw", "apple-vpio"}:
                     preferred_modes = ("raw",) if audio_backend == "apple-raw" else ("vpio", "raw")
@@ -7343,12 +8942,13 @@ def main() -> int:
                         channels=CHANNELS,
                         dtype=DTYPE,
                         blocksize=FRAME_SAMPLES,
-                        device=args.input_device,
+                        device=sounddevice_input_device(),
                         callback=audio_callback,
                     )
                 with audio_ctx as ctx:
                     if audio_backend in {"apple-raw", "apple-vpio"}:
                         audio_bridge = ctx
+                    update_stage_status("capture", "listening", f"{audio_backend}; legacy endpointing")
                     while True:
                         if not handle_interactive_key(0.05):
                             break
@@ -7361,28 +8961,8 @@ def main() -> int:
                     break
                 if key in ("\n", "\r"):
                     if text_buffer.strip():
-                        text = normalize_text(text_buffer)
-                        text_entry_seq += 1
-                        entry_id = text_entry_seq
-                        with ui_lock:
-                            ui_set_panel_entry("right", entry_id, "src", f"⌨️ {target_label()}: {color_right_en(text)}", final=True)
-                            ui_state["input"] = ""
-                            render_dashboard()
-                        log_debug(f"queued typed text chars={len(text)}")
-                        with session_log_lock:
-                            typed_input_texts[entry_id] = text
-                        enqueue_translation_task(
-                            TranslationTask(
-                                source="text",
-                                text=text,
-                                src_lang=target_nllb_lang(),
-                                beams=max(1, args.mt_beams),
-                                target_lang=source_language_code(),
-                                forced_bos_id=forced_bos_for_target(source_language_code()),
-                                utterance_id=entry_id,
-                            )
-                        )
-                        text_buffer = ""
+                        if submit_typed_reply(text_buffer):
+                            text_buffer = ""
                     continue
                 if key == "\x7f":
                     if text_buffer:
@@ -7397,11 +8977,34 @@ def main() -> int:
         stop_asr_process()
         stop_mt_process()
         audio_bridge = None
+        active_ring_feeder = None
+        if audio_evidence is not None:
+            audio_evidence.close(timeout=5)
+        if headless_transport is not None and sys.exc_info()[0] is None:
+            headless_transport.close(timeout=1)
         restore_terminal()
-        print("\x1b[H\x1b[2JExited.")
+        if args.ui != "headless":
+            print("\x1b[H\x1b[2JExited.")
 
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        raise SystemExit(130)
+    except Exception as exc:
+        if args.ui == "headless":
+            update_stage_status("capture", "failed", str(exc))
+            ui_update(status=f"Unable to run: {exc}")
+        eprint(f"❌ Unable to run: {exc}")
+        error_directory = runtime_session_dir or Path(__file__).resolve().parent / "runtime-reports"
+        eprint(f"Check the input device/LitLink route and the ASR/TRANSLATION status. Full worker errors: {error_directory / 'pipeline-events.jsonl'}")
+        if args.debug:
+            import traceback
+            traceback.print_exc()
+        raise SystemExit(1)
+    finally:
+        if headless_transport is not None:
+            headless_transport.close(timeout=1)

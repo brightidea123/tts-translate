@@ -1,0 +1,95 @@
+{
+  "schema_version": 1,
+  "verified_on": "2026-11-07",
+  "hardware_target": "Apple M4 Max, 48 GB unified memory, native ARM64 Python 3.12",
+  "language_order": ["ar", "he", "de", "tr", "fr", "ru"],
+  "default_profile": "baseline",
+  "notes": [
+    "These are model-selection recommendations; application code must explicitly load/apply this file to activate them.",
+    "Reported weight sizes are download sizes, not peak unified memory measurements.",
+    "No M4 Max latency or accuracy benchmark was performed to select these profiles.",
+    "Use one shared model instance per worker, not a separate model per language; retain utterance/revision ordering in the caller.",
+    "TranslateGemma requires structured source_lang_code/target_lang_code messages, rather than a generic system/user instruction prompt."
+  ],
+  "profiles": {
+    "baseline": {
+      "purpose": "Practical transcription-plus-translation starting point; measure with the user's six languages.",
+      "asr": {
+        "backend": "mlx-whisper",
+        "model": "mlx-community/whisper-large-v3-mlx",
+        "task": "transcribe",
+        "force_selected_source_language": true,
+        "weight_download_gb_approx": 3.08,
+        "source_urls": [
+          "https://huggingface.co/mlx-community/whisper-large-v3-mlx",
+          "https://github.com/openai/whisper",
+          "https://raw.githubusercontent.com/openai/whisper/main/whisper/tokenizer.py"
+        ]
+      },
+      "translation": {
+        "backend": "mlx-lm",
+        "model": "mlx-community/translategemma-12b-it-4bit",
+        "message_schema": "translategemma",
+        "weight_download_gb_approx": 6.62,
+        "source_urls": [
+          "https://huggingface.co/mlx-community/translategemma-12b-it-4bit",
+          "https://huggingface.co/google/translategemma-12b-it",
+          "https://arxiv.org/pdf/2601.09012"
+        ]
+      }
+    },
+    "quality_comparison": {
+      "purpose": "Larger translation model to compare with the same full large-v3 ASR; no universal quality or speed ranking is claimed.",
+      "asr": {
+        "backend": "mlx-whisper",
+        "model": "mlx-community/whisper-large-v3-mlx",
+        "task": "transcribe",
+        "force_selected_source_language": true,
+        "weight_download_gb_approx": 3.08,
+        "source_urls": [
+          "https://huggingface.co/mlx-community/whisper-large-v3-mlx/tree/main",
+          "https://github.com/openai/whisper"
+        ]
+      },
+      "translation": {
+        "backend": "mlx-lm",
+        "model": "mlx-community/translategemma-27b-it-4bit",
+        "message_schema": "translategemma",
+        "weight_download_gb_approx": 15.2,
+        "source_urls": [
+          "https://huggingface.co/mlx-community/translategemma-27b-it-4bit",
+          "https://huggingface.co/google/translategemma-12b-it",
+          "https://arxiv.org/pdf/2601.09012"
+        ]
+      }
+    },
+    "gemma4_audio_optional": {
+      "purpose": "Selectable reconstruction of the recovered Gemma audio backend; evaluate separately before using as default.",
+      "asr": {
+        "backend": "mlx-vlm-gemma",
+        "model": "mlx-community/gemma-4-e4b-it-4bit",
+        "task": "source-language transcription",
+        "force_selected_source_language": true,
+        "maximum_audio_clip_seconds": 30,
+        "audio_sample_rate_hz": 16000,
+        "audio_channels": 1,
+        "weight_download_gb_approx": 5.15,
+        "source_urls": [
+          "https://huggingface.co/mlx-community/gemma-4-e4b-it-4bit",
+          "https://ai.google.dev/gemma/docs/core/model_card_4",
+          "https://ai.google.dev/gemma/docs/capabilities/audio"
+        ]
+      },
+      "translation": {
+        "backend": "mlx-lm",
+        "model": "mlx-community/translategemma-12b-it-4bit",
+        "message_schema": "translategemma",
+        "weight_download_gb_approx": 6.62,
+        "source_urls": [
+          "https://huggingface.co/mlx-community/translategemma-12b-it-4bit",
+          "https://huggingface.co/google/translategemma-12b-it"
+        ]
+      }
+    }
+  }
+}

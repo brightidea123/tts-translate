@@ -1,0 +1,14 @@
+.venv/
+.wheelhouse/
+/models/
+/runtime-reports/
+/recordings/
+/fixtures/generated/
+__pycache__/
+*.pyc
+/apple_vpio_bridge
+/apple_vpio_timestamp_bridge
+/transcription.log
+/tts.log
+/output.wav
+/effective-config.json

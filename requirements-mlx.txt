@@ -1,0 +1,14 @@
+# Resolved live-backend roots on 2026-11-06: CPython 3.12, macOS arm64, macOS 26+.
+# Installation/dependency checks passed; Metal inference is blocked in the
+# restoration sandbox. See docs/RUNTIME_VALIDATION.md for actual validation.
+# Use requirements-macos-arm64-py312.lock.txt for hash-verified reproduction.
+-r requirements.txt
+numpy==2.5.4; python_version == "3.12" and sys_platform == "darwin" and platform_machine == "arm64"
+sounddevice==0.5.6; python_version == "3.12" and sys_platform == "darwin" and platform_machine == "arm64"
+mlx==0.32.4; python_version == "3.12" and sys_platform == "darwin" and platform_machine == "arm64"
+mlx-metal==0.32.4; python_version == "3.12" and sys_platform == "darwin" and platform_machine == "arm64"
+mlx-whisper==0.4.3; python_version == "3.12" and sys_platform == "darwin" and platform_machine == "arm64"
+mlx-lm==0.32.2; python_version == "3.12" and sys_platform == "darwin" and platform_machine == "arm64"
+# Installed for optional Gemma audio/VLM profiles; baseline uses Whisper + MLX LM.
+mlx-vlm==0.7.12; python_version == "3.12" and sys_platform == "darwin" and platform_machine == "arm64"
+mlx-audio[stt]==0.6.4; python_version == "3.12" and sys_platform == "darwin" and platform_machine == "arm64"

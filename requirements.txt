@@ -1,0 +1,2 @@
+# Reconstructed minimum diagnostic dependencies; no original lockfile survived.
+numpy
