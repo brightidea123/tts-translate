@@ -54,6 +54,18 @@ export function messageIsFinal(item) {
   return Boolean((item.source_final ?? item.src_final ?? false) && (item.translation_final ?? item.dst_final ?? false));
 }
 
+export function messageStatus(item, kind = 'transcript') {
+  const reviewRequired = item.review_required === true;
+  const sourceFinal = item.source_final ?? item.src_final ?? false;
+  const final = messageIsFinal(item);
+  return {
+    complete: reviewRequired || final,
+    reviewRequired,
+    label: reviewRequired ? 'Review needed' : final ? 'Complete' : sourceFinal ? 'Translating' : kind === 'transcript' ? 'Listening' : 'Translating',
+    reason: reviewRequired ? String(item.review_reason || 'Final recognition needs review') : '',
+  };
+}
+
 const phraseTimeFormatters = new BoundedCache(8);
 
 function phraseTimeFormats(timeZone) {

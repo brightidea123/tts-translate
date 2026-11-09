@@ -1,4 +1,4 @@
-import { AutoScrollController, SelectionTranslator, messageIsFinal, inputSelectionAvailable, selectInputDevice, refreshInputOptions, renderSourcePreview, renderPhraseTiming } from './ui-interactions.js';
+import { AutoScrollController, SelectionTranslator, messageStatus, inputSelectionAvailable, selectInputDevice, refreshInputOptions, renderSourcePreview, renderPhraseTiming } from './ui-interactions.js';
 
 (() => {
   'use strict';
@@ -262,11 +262,12 @@ import { AutoScrollController, SelectionTranslator, messageIsFinal, inputSelecti
       if (node.card === protectedCard) continue;
       node.number.textContent = `${kind === 'transcript' ? 'PHRASE' : 'REPLY'} ${String(index + 1).padStart(2, '0')}`;
       if (kind === 'transcript') renderPhraseTiming(node.timing, item);
-      const sourceFinal = item.source_final ?? item.src_final ?? false;
-      const translationFinal = item.translation_final ?? item.dst_final ?? false;
-      node.card.dataset.final = String(messageIsFinal(item));
-      node.phase.dataset.final = String(Boolean(sourceFinal && translationFinal));
-      node.phase.textContent = sourceFinal && translationFinal ? 'Complete' : sourceFinal ? 'Translating' : kind === 'transcript' ? 'Listening' : 'Translating';
+      const status = messageStatus(item, kind);
+      node.card.dataset.final = String(status.complete);
+      node.card.dataset.reviewRequired = String(status.reviewRequired);
+      node.phase.dataset.final = String(status.complete);
+      node.phase.textContent = status.label;
+      node.phase.title = status.reason;
       const sourceCode = codeOf(item.source_language || source);
       const targetCode = codeOf(item.target_language || target);
       for (const [partKind, text, language] of [
@@ -275,6 +276,7 @@ import { AutoScrollController, SelectionTranslator, messageIsFinal, inputSelecti
       ]) {
         const part = node.parts[partKind];
         const clean = cleanDisplay(text);
+        part.part.hidden = status.reviewRequired && partKind === 'translation' && !clean;
         part.part.dir = directionOf(language);
         part.content.lang = language.toLowerCase();
         part.content.dir = 'auto';

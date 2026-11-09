@@ -34,6 +34,8 @@ main{padding-top:25px;padding-bottom:22px}.session-card{border:1px solid var(--l
 .message-text .transcript-provisional{color:#b3261e;text-decoration-line:underline;text-decoration-style:solid;text-decoration-color:currentColor;text-underline-offset:.2em;text-decoration-thickness:1px}
 .message-card[data-final=false] .message-text .transcript-provisional{color:#ffb4ab}
 .message-heading{display:flex;align-items:center;flex-wrap:wrap;gap:4px 9px;min-width:0;direction:ltr}.message-timing{font-size:9px;color:#748995;font-variant-numeric:tabular-nums;white-space:nowrap;unicode-bidi:isolate}.message-card[data-final=false] .message-timing{color:#b1cbd5}.message-phase{flex:none}
+.message-card[data-review-required=true]{border-color:#d6b97c;box-shadow:inset 3px 0 #bd913f}
+.message-card[data-review-required=true] .message-phase{color:#895d1f}
 
 /* Keep the reading panes dense while retaining extra space for RTL glyphs. */
 main{padding-top:16px}

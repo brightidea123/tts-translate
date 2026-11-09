@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import codecs
+from copy import deepcopy
 import hashlib
 from collections import deque
 from datetime import datetime, timezone
@@ -53,10 +54,16 @@ from translation_prompts import build_translation_messages
 from tts_runtime.worker import ProcessStage, StageEvent
 from tts_runtime.text_output import clean_model_output, configure_translation_stop_tokens
 from tts_runtime.asr_quality import pcm_quality, summarize_whisper_result, issue_reasons, final_preview_disagrees
+from tts_runtime.asr_consistency import decoder_repetition_loop, is_outro_candidate, outro_conflicts_with_preview
+from tts_runtime.asr_recovery import recovery_windows, stitch_recovery
+from tts_runtime.asr_verification import assess_verification
 from tts_runtime.audio_evidence import AudioEvidence, create_session_directory
-from tts_runtime.audio_devices import checked_input_device
+from tts_runtime.audio_devices import checked_input_device, describe_input_device
+from tts_runtime.local_settings import load_input_preference
 from tts_runtime.live_preview import merge_preview, word_key
 from tts_runtime.clip_timing import capture_clip_timing
+from tts_runtime.endpoint_timing import PartialTextTiming, completed_pause_estimate
+from tts_runtime.partial_translation import PartialTranslationCandidate, update_candidate
 from tts_runtime.model_assets import resolve_mlx_whisper_reference, require_cached_mlx_whisper, LARGE_V3_REPOSITORY
 from tts_runtime.selection_inference import SelectionTask, SelectionResult
 from optional_dependencies import optional_dependency
@@ -119,6 +126,7 @@ runtime_session_id = ""
 audio_wall_clock_offset_ns = time.time_ns() - time.monotonic_ns()
 runtime_session_dir: Path | None = None
 runtime_audio_dir: Path | None = None
+resolved_capture_input: dict | None = None
 audio_review_mode = "off"
 audio_evidence: AudioEvidence | None = None
 asr_request_context: dict = {}
@@ -362,6 +370,7 @@ parser.add_argument("--mt-process", action="store_true", default=True, help="run
 parser.add_argument("--no-mt-process", dest="mt_process", action="store_false")
 parser.add_argument("--startup-timeout", type=float, default=180.0, help="maximum seconds for each model worker to initialize; failures stay visible in the dashboard")
 parser.add_argument("--inference-timeout", type=float, default=120.0, help="maximum seconds for one model request before its worker is stopped")
+parser.add_argument("--shutdown-grace-seconds", type=float, default=6.0, help="maximum time to finish accepted final transcription/translation on Stop; 0 skips inference drain")
 parser.add_argument("--inference-queue-size", type=int, default=16, help="bounded pending requests per model worker; overflow is reported without blocking capture or typing")
 parser.add_argument("--mt-queue-size", type=int, default=3, help="max pending translation tasks before stale speculative audio translations are dropped")
 parser.add_argument("--mt-chunk-max-chars", type=int, default=1800, help="max source chars per MLX-LM translation request; larger values preserve context, <=0 disables MLX chunking")
@@ -380,7 +389,7 @@ parser.add_argument("--kokoro-voice-tr", default="", help="Kokoro voice for Turk
 parser.add_argument("--kokoro-lang-en", default="en-us", help="Kokoro language code for English output")
 parser.add_argument("--kokoro-lang-tr", default="tr", help="Kokoro language code for Turkish output")
 parser.add_argument("--tts-speed", type=float, default=1.0, help="local TTS speed multiplier")
-parser.add_argument("--input-device", help="sounddevice input device name or index")
+parser.add_argument("--input-device", help="sounddevice input name/index; 'default' explicitly selects the system default over saved settings")
 parser.add_argument("--audio-io", choices=["auto", "sounddevice", "apple-raw", "apple-vpio"], default="sounddevice", help="audio capture/playback backend")
 parser.add_argument("--streaming-engine", choices=["auto", "ring", "legacy"], default="ring", help="audio streaming engine: ring uses ordered timestamped PCM frames + priority ASR with any capture backend; legacy uses the older queue pipeline")
 parser.add_argument("--apple-bridge-path", default=str(Path(__file__).with_name("apple_vpio_bridge")), help="path to Swift AVAudioEngine/VPIO bridge used for capture + playback")
@@ -389,7 +398,7 @@ parser.add_argument("--translation-stable-only", action="store_true", default=Tr
 parser.add_argument("--no-translation-stable-only", dest="translation_stable_only", action="store_false")
 parser.add_argument("--partial-translation-policy", choices=["stable", "speculative", "off"], default="stable", help="audio partial MT policy: stable=translate only locked prefix, speculative=display-only MT for changed partials, off=no partial MT")
 parser.add_argument("--stable-translation-min-words", type=int, default=3, help="minimum newly-stable words before translating a partial audio prefix")
-parser.add_argument("--partial-translation-stabilize-seconds", type=float, default=2.0, help="wait this many seconds without Turkish partial text changes before queueing partial MT")
+parser.add_argument("--partial-translation-stabilize-seconds", type=float, default=2.0, help="batch confirmed ASR prefixes at this minimum interval; speculative MT waits for text to settle")
 parser.add_argument("--partial-translation-min-completeness-score", type=int, default=2, help="minimum semantic completeness score before translating a stabilized partial clump")
 parser.add_argument("--partial-translation-force-words", type=int, default=10, help="translate a stabilized partial clump once it reaches this many words even without punctuation")
 parser.add_argument("--partial-display-policy", choices=["stable", "clump", "latest"], default="latest", help="source panel partial policy: latest=show provisional words immediately, stable=show locked ASR only, clump=show only translation-ready clumps")
@@ -475,6 +484,14 @@ if args.source_language == args.target_language:
     parser.error("--source-language and --target-language must be different")
 
 EXPLICIT_FLAGS = {token.split("=", 1)[0] for token in sys.argv[1:] if token.startswith("--")}
+if "--input-device" in EXPLICIT_FLAGS:
+    if isinstance(args.input_device, str) and args.input_device.strip().casefold() == "default":
+        args.input_device = None
+elif not ("--audio-io" in EXPLICIT_FLAGS and args.audio_io in {"apple-raw", "apple-vpio"}):
+    try:
+        args.input_device = load_input_preference(Path(__file__).with_name("settings.local.json"))
+    except ValueError as exc:
+        parser.error(str(exc))
 USER_SET_WHISPER_MODEL = "--whisper-model" in EXPLICIT_FLAGS
 USER_SET_STT_BACKEND = "--stt-backend" in EXPLICIT_FLAGS
 USER_SET_TRANSLATION_MODEL = "--translation-model" in EXPLICIT_FLAGS
@@ -746,6 +763,7 @@ def effective_config() -> dict:
         "source_nllb_lang": source_nllb_lang(),
         "target_nllb_lang": target_nllb_lang(),
         "input_device": args.input_device,
+        "resolved_input_device": resolved_capture_input,
         "audio_io": resolve_audio_io_backend() if args.mode in {"audio", "both"} else args.audio_io,
         "streaming_engine": resolve_streaming_engine() if args.mode in {"audio", "both"} else args.streaming_engine,
         "apple_bridge_path": args.apple_bridge_path,
@@ -860,6 +878,7 @@ def effective_config() -> dict:
         "tts_bleed_hold_ms": args.tts_bleed_hold_ms,
         "playback_guard_ms": args.playback_guard_ms,
         "latency_stats": args.latency_stats,
+        "shutdown_grace_seconds": args.shutdown_grace_seconds,
         "session_logs": args.session_logs,
         "transcription_log": args.transcription_log if args.session_logs else "",
         "tts_log": args.tts_log if args.session_logs else "",
@@ -988,16 +1007,6 @@ class TranslationResult:
     chunk_index: int = 0
     total_chunks: int = 1
     error: str = ""
-
-
-@dataclass(slots=True)
-class PartialTranslationCandidate:
-    text: str
-    locked_prefix: str
-    revision: int
-    stable_text: str
-    stable_changed_at: float
-    last_sent_text: str = ""
 
 
 @dataclass(slots=True)
@@ -1151,6 +1160,8 @@ def validate_runtime_configuration() -> None:
         problems.append("queue sizes must be >= 1")
     if args.inference_queue_size < 1 or args.startup_timeout <= 0 or args.inference_timeout <= 0:
         problems.append("inference queue size and worker timeouts must be positive")
+    if not np.isfinite(args.shutdown_grace_seconds) or args.shutdown_grace_seconds < 0:
+        problems.append("--shutdown-grace-seconds must be nonnegative and finite")
     if args.capture_queue_ms < FRAME_MS:
         problems.append(f"--capture-queue-ms must be >= {FRAME_MS}")
     if not np.isfinite(args.ring_buffer_seconds) or args.ring_buffer_seconds <= 0:
@@ -2288,17 +2299,29 @@ def sentence_completeness_score(text: str) -> int:
     lowered = text.casefold()
     words = lowered.split()
     word_count = len(words)
-    last_word = words[-1] if words else ""
+    last_word = words[-1].strip(".,;:!?…،؛؟\"'»”’)]}׳״") if words else ""
     first_word = words[0] if words else ""
 
-    final_punct = text.endswith((".", "?", "!"))
-    soft_punct = text.endswith((",", ";", ":"))
+    ending = text.rstrip(" \t\n\"'»”’)]}׳״")
+    ellipsis = ending.endswith(("...", "…"))
+    final_punct = not ellipsis and ending.endswith((".", "?", "!", "؟", "。", "！", "？"))
+    soft_punct = ending.endswith((",", ";", ":", "،", "؛"))
     incomplete_endings = {
         "ve", "ama", "ya", "veya", "ile", "gibi", "çünkü", "için", "ki", "de", "da",
         "sonra", "önce", "eğer", "şey", "yani", "fakat", "ancak", "olarak", "kadar", "üzere",
         "the", "a", "an", "and", "or", "but", "to", "of", "for", "with", "that", "because",
         "if", "when", "while", "so", "as", "like", "about",
     }
+    incomplete_endings.update({
+        "AR": {"في", "إلى", "الى", "على", "من", "مع", "عن", "أن", "ان", "لأن", "لكن", "إذا", "أو", "حتى", "عندما", "بين"},
+        "HE": {"אבל", "או", "כי", "אם", "של", "את", "עם", "על", "אל", "כדי", "בין", "בלי", "לפני", "אחרי", "כמו"},
+        "DE": {"und", "oder", "aber", "weil", "dass", "wenn", "mit", "für", "zu", "von"},
+        "FR": {"et", "ou", "mais", "parce", "que", "pour", "avec", "sans", "dans", "si"},
+        "RU": {"и", "или", "но", "потому", "что", "если", "для", "без", "когда", "чтобы"},
+    }.get(source_language_code(), set()))
+    unfinished_word = last_word in incomplete_endings and not (word_count <= 2 and ending.endswith(("?", "؟", "？")))
+    if unfinished_word:
+        final_punct = False
     incomplete_tail_phrases = (
         "istiyorum ki", "şunu istiyorum", "bunu istiyorum", "demek istiyorum", "söylemek istiyorum",
         "i want to", "i would like to", "i need to", "i was going to", "what i mean is",
@@ -2324,7 +2347,9 @@ def sentence_completeness_score(text: str) -> int:
         score += 3
     elif soft_punct:
         score -= 1
-    if last_word in incomplete_endings:
+    if ellipsis:
+        score -= 2
+    if unfinished_word:
         score -= 3
     if lowered.endswith(incomplete_tail_phrases):
         score -= 4
@@ -2664,7 +2689,7 @@ def log_final_transcription(utterance_id: int | None, transcription_text: str, t
         {
             "type": "audio_transcription",
             "utterance_id": utterance_id,
-            "transcription_lang": source_language_code(),
+            "transcription_lang": audio_final_source_languages.get(utterance_id, source_language_code()),
             "translation_lang": target_language_code(),
             "transcription": strip_for_log(transcription_text),
             "translation": strip_for_log(translation_text),
@@ -3073,7 +3098,7 @@ def ui_commit_if_ready(side: str, entry_id: int) -> None:
         return
     if entry.get("src_final") and entry.get("dst_final"):
         ui_state[done_key].append({"entry_id": entry_id, "src": entry.get("src", ""), "dst": entry.get("dst", ""),
-                                  **{key: entry[key] for key in ("audio_started_at", "audio_duration_seconds") if key in entry}})
+                                  **{key: entry[key] for key in ("audio_started_at", "audio_duration_seconds", "source_language") if key in entry}})
         ui_state[active_key].pop(entry_id, None)
         ui_state[order_key] = [x for x in ui_state[order_key] if x != entry_id]
 
@@ -3109,6 +3134,7 @@ def ui_set_panel_entry(
     *,
     preview: dict | None = None,
     audio_timing: dict | None = None,
+    source_language_override: str | None = None,
 ) -> bool:
     active_key = f"{side}_active"
     order_key = f"{side}_order"
@@ -3131,6 +3157,8 @@ def ui_set_panel_entry(
         ui_state[order_key].append(entry_id)
 
     if field == "src":
+        if source_language_override is not None:
+            entry["source_language"] = source_language_override
         if side == "left" and audio_timing:
             update_entry_audio_timing(entry, audio_timing, final=final)
         entry.pop("source_preview", None)
@@ -3659,6 +3687,7 @@ mlx_vlm_lock = threading.Lock()
 
 session_log_lock = threading.Lock()
 audio_final_transcripts: dict[int, str] = {}
+audio_final_source_languages: dict[int, str] = {}
 typed_input_texts: dict[int, str] = {}
 logged_audio_translation_keys: set[tuple[int, int]] = set()
 logged_audio_translation_utterances: set[int] = set()
@@ -4204,7 +4233,8 @@ def is_mlx_whisper_beam_unavailable(exc: Exception) -> bool:
     return "beam search" in message and "not yet implemented" in message
 
 
-def transcribe_audio_mlx_whisper(prepared_audio: np.ndarray, model_name: str | None = None, beam: int = 1) -> str:
+def transcribe_audio_mlx_whisper(prepared_audio: np.ndarray, model_name: str | None = None, beam: int = 1,
+                                 *, word_timestamps: bool = False, language_override: str | None = None) -> str:
     global mlx_whisper_beam_available, mlx_whisper_beam_fallback_reported
     model_ref = resolve_mlx_whisper_model_ref_for(model_name or args.whisper_model)
     mlx_module = None
@@ -4215,13 +4245,16 @@ def transcribe_audio_mlx_whisper(prepared_audio: np.ndarray, model_name: str | N
             log_verbose(f"mlx-whisper Python backend unavailable; trying CLI fallback ({exc})")
     if mlx_module is not None:
         requested_beam = max(1, int(beam))
+        language_kwargs = asr_language_kwargs()
+        if language_override is not None:
+            language_kwargs = {"language": None if language_override == "auto" else language_spec(language_override).whisper}
         decode_kwargs = {
             "path_or_hf_repo": model_ref,
-            **asr_language_kwargs(),
+            **language_kwargs,
             "task": "transcribe",
             "condition_on_previous_text": False,
             **asr_initial_prompt_kwargs(),
-            "word_timestamps": False,
+            "word_timestamps": word_timestamps,
             "verbose": False,
             "temperature": 0.0,
             "compression_ratio_threshold": anti_repeat_thresholds()[2],
@@ -4251,8 +4284,11 @@ def transcribe_audio_mlx_whisper(prepared_audio: np.ndarray, model_name: str | N
         last_decoder_quality["requested_beam"] = requested_beam
         last_decoder_quality["effective_beam"] = requested_beam if "beam_size" in decode_kwargs else 1
         last_decoder_quality["beam_search_available"] = mlx_whisper_beam_available
+        last_decoder_quality["language_auto_detected"] = language_kwargs.get("language") is None
         return text if looks_like_real_text(text) else ""
 
+    if word_timestamps or language_override is not None:
+        raise RuntimeError("Timestamped ASR recovery and language verification require the mlx-whisper Python backend")
     cmd = resolve_stt_command("mlx_whisper", ("mlx-whisper",))
     tmpdir, wav_path = save_prepared_audio_wav(prepared_audio, "tts-transcribe-mlx-whisper-")
     with tmpdir:
@@ -5384,21 +5420,37 @@ class RingEndpointDetector:
         self.pending_final = False
         self.pending_final_started_sample: int | None = None
         self.pause_ewma_ms = float(args.silence_base_ms)
+        self.completed_pause_count = 0
+        self.last_speech_end_ns: int | None = None
+        self.endpoint_text_fresh = False
         self.adaptive_silence_ms = int(args.silence_base_ms)
 
     def _current_endpoint_threshold(self) -> int:
         # Apply the legacy adaptive/semantic endpointing logic to the ring path.
-        text, stability, last_change_ms, locked_ratio = partial_endpoint_snapshot(self.utterance_id)
+        capture_end_ns = (self.active_timestamps[-1] + int(self.active[-1].size) * 1_000_000_000 // SAMPLE_RATE
+                          if self.active_timestamps else None)
+        text, stability, last_change_ms, locked_ratio, covered_until = partial_endpoint_observation(
+            self.utterance_id, captured_until_ns=capture_end_ns)
         base = compute_adaptive_threshold(self.pause_ewma_ms, self.speech_ms)
-        base = semantic_endpoint_threshold(base, text)
-        base = transcript_stability_bias(base, stability, last_change_ms)
-        confidence = commit_confidence_score(text, stability, last_change_ms, self.silence_ms, locked_ratio)
-        base = confidence_adjusted_endpoint_threshold(base, confidence)
-        if should_semantic_endpoint(text, stability, last_change_ms, self.silence_ms, locked_ratio):
-            base = min(base, max(args.semantic_min_silence_ms, args.silence_min_ms))
+        self.endpoint_text_fresh = bool(covered_until is not None and self.last_speech_end_ns is not None
+                                        and covered_until + 2 * 1_000_000_000 // SAMPLE_RATE >= self.last_speech_end_ns)
+        confidence = 0
+        if text and self.endpoint_text_fresh:
+            acoustic_base = base
+            base = semantic_endpoint_threshold(base, text)
+            if sentence_completeness_score(text) >= 3:
+                base = transcript_stability_bias(base, stability, last_change_ms)
+                confidence = commit_confidence_score(text, stability, last_change_ms, self.silence_ms, locked_ratio)
+                base = confidence_adjusted_endpoint_threshold(base, confidence)
+                if should_semantic_endpoint(text, stability, last_change_ms, self.silence_ms, locked_ratio):
+                    base = min(base, max(args.semantic_min_silence_ms, args.silence_min_ms))
+            else:
+                # Repetition/agreement is not evidence that an unfinished
+                # clause or ellipsis became a complete sentence.
+                base = max(acoustic_base, base)
         self.adaptive_silence_ms = max(args.silence_min_ms, min(args.silence_max_ms, int(base)))
         if args.debug and self.silence_ms and self.silence_ms % 200 == 0:
-            log_debug(f"ring endpoint silence_ms={self.silence_ms} threshold_ms={self.adaptive_silence_ms} text='{truncate_visible(text, 48)}'")
+            log_debug(f"ring endpoint silence_ms={self.silence_ms} threshold_ms={self.adaptive_silence_ms} text_fresh={self.endpoint_text_fresh} text='{truncate_visible(text, 48)}'")
         return self.adaptive_silence_ms
 
     def _active_partial_window(self) -> np.ndarray:
@@ -5443,7 +5495,12 @@ class RingEndpointDetector:
         provenance = self._window_provenance(pcm, frame_count)
         if not partial:
             provenance.update(boundary_reason=boundary_reason or "endpoint",
-                              forced_speech_boundary=forced_speech_boundary)
+                              forced_speech_boundary=forced_speech_boundary,
+                              trailing_silence_ms=self.silence_ms, endpoint_threshold_ms=self.adaptive_silence_ms,
+                              finalization_hold_ms=args.finalization_hold_ms,
+                              completed_pause_count=self.completed_pause_count,
+                              completed_pause_estimate_ms=round(self.pause_ewma_ms, 3),
+                              endpoint_text_fresh=self.endpoint_text_fresh)
         method = getattr(self.scheduler, "submit_with_provenance", None)
         if method is not None:
             return method(self.utterance_id, pcm, partial, provenance)
@@ -5477,7 +5534,9 @@ class RingEndpointDetector:
                 self.total_frames = 1
                 self.trailing_silence_frames = 0
                 self.last_partial_ms = 0
-                self.pause_ewma_ms = float(args.silence_base_ms)
+                self.completed_pause_count = 0
+                self.endpoint_text_fresh = False
+                self.last_speech_end_ns = frame.timestamp_ns + int(frame.pcm.size) * 1_000_000_000 // SAMPLE_RATE
                 self.adaptive_silence_ms = int(args.silence_base_ms)
             return
         self.active.append(frame.pcm)
@@ -5486,6 +5545,11 @@ class RingEndpointDetector:
         self.total_ms += FRAME_MS
         self.total_frames += 1
         if frame.is_speech:
+            if self.silence_ms:
+                self.pause_ewma_ms = completed_pause_estimate(self.pause_ewma_ms, self.silence_ms,
+                    base_ms=args.silence_base_ms, maximum_ms=args.silence_max_ms, alpha=args.adapt_alpha)
+                self.completed_pause_count += 1
+            self.last_speech_end_ns = frame.timestamp_ns + int(frame.pcm.size) * 1_000_000_000 // SAMPLE_RATE
             self.speech_ms += FRAME_MS
             self.speech_frames += 1
             self.silence_ms = 0
@@ -5496,7 +5560,6 @@ class RingEndpointDetector:
         else:
             self.silence_ms += FRAME_MS
             self.trailing_silence_frames += 1
-            self.pause_ewma_ms = (1.0 - args.adapt_alpha) * self.pause_ewma_ms + args.adapt_alpha * float(self.silence_ms)
         if self.silence_ms == 0 and not self.pending_final and self.total_ms - self.last_partial_ms >= int(args.streaming_asr_chunk_seconds * 1000):
             self.last_partial_ms = self.total_ms
             partial_pcm = self._active_partial_window()
@@ -5510,20 +5573,32 @@ class RingEndpointDetector:
         if self.active_samples >= round(self.HARD_WINDOW_SECONDS * SAMPLE_RATE):
             self._finalize_locked(force=True, boundary_reason="hard_duration_limit", forced_speech_boundary=True)
             return
-        if (self.active_samples >= round(MAX_UTTERANCE_SECONDS * SAMPLE_RATE)
-                and self.silence_ms >= self.SOFT_BOUNDARY_SILENCE_MS):
-            self._finalize_locked(boundary_reason="soft_duration_silence", keep_quiet_preroll=True)
-            return
+        soft_boundary = self.active_samples >= round(MAX_UTTERANCE_SECONDS * SAMPLE_RATE)
         endpoint_threshold = self._current_endpoint_threshold() if self.silence_ms else self.adaptive_silence_ms
+        if soft_boundary:
+            endpoint_threshold = max(self.SOFT_BOUNDARY_SILENCE_MS, endpoint_threshold)
+            self.adaptive_silence_ms = endpoint_threshold
+        # A faster pause deadline must not discard a valid short answer just
+        # before the minimum decoder span is reached. Retain the quiet tail.
+        minimum_input_samples = round(max(MIN_UTTERANCE_SECONDS, args.final_min_asr_seconds) * SAMPLE_RATE)
         if self.silence_ms >= endpoint_threshold:
+            boundary_reason = "soft_duration_silence" if soft_boundary else "endpoint"
             if args.finalization_hold_ms <= 0:
-                self._finalize_locked(force=False)
+                if self.active_samples >= minimum_input_samples:
+                    self._finalize_locked(force=False, boundary_reason=boundary_reason, keep_quiet_preroll=soft_boundary)
             elif not self.pending_final:
                 self.pending_final = True
                 self.pending_final_started_sample = self.active_samples
-            elif ((self.active_samples - self.pending_final_started_sample) * 1000
+            elif (self.active_samples >= minimum_input_samples
+                  and self.silence_ms >= endpoint_threshold + args.finalization_hold_ms
+                  and (self.active_samples - self.pending_final_started_sample) * 1000
                   >= args.finalization_hold_ms * SAMPLE_RATE):
-                self._finalize_locked(force=False)
+                self._finalize_locked(force=False, boundary_reason=boundary_reason, keep_quiet_preroll=soft_boundary)
+        elif self.pending_final:
+            # A newer hypothesis may extend the required pause while a final
+            # is pending. Start a fresh hold when that later deadline is met.
+            self.pending_final = False
+            self.pending_final_started_sample = None
 
     def finalize(self, force: bool = False) -> None:
         with self.lock:
@@ -5845,9 +5920,10 @@ def prepare_asr_audio(audio_i16: np.ndarray) -> np.ndarray:
 
 def retain_asr_evidence(audio_i16: np.ndarray, text: str, error: str | None = None) -> None:
     raw_text = str(last_decoder_quality.get("raw_text", text))
+    verified_source = last_asr_diagnostics.get("verified_source_language")
     reasons = issue_reasons(last_asr_diagnostics["pcm"], text, raw_text=raw_text,
                             decoder_quality=last_decoder_quality,
-                            expected_language=source_language().whisper, error=error,
+                            expected_language=language_spec(verified_source).whisper if verified_source else source_language().whisper, error=error,
                             gap=bool(asr_request_context.get("capture_gap")))
     if last_asr_diagnostics.get("model_input", {}).get("out_of_range_fraction", 0) > 0:
         reasons.append("model_input_out_of_range")
@@ -5882,6 +5958,125 @@ def retain_asr_evidence(audio_i16: np.ndarray, text: str, error: str | None = No
 asr_preview_evidence: dict[int, str] = {}
 
 
+def verify_final_audio(candidate: str, *, reason: str) -> str:
+    """Verify exceptional finals using acoustic language detection, not script guesses."""
+    primary = deepcopy(last_decoder_quality)
+    verification = {"status": "unresolved", "reason": reason, "primary_text": candidate, "attempts": []}
+    last_asr_diagnostics["final_verification"] = verification
+    try:
+        if last_prepared_audio is None or last_prepared_audio.size > 32 * SAMPLE_RATE:
+            raise ValueError("No bounded prepared audio is available for language verification")
+
+        def decode(language: str) -> dict:
+            text = transcribe_audio_mlx_whisper(last_prepared_audio, model_name=effective_lane_model(False),
+                beam=effective_lane_beam(False), word_timestamps=True, language_override=language)
+            summary = deepcopy(last_decoder_quality)
+            verification["attempts"].append({"language_request": language, "decoder": summary})
+            # Preserve the decoder's raw evidence in attempts, while assessing
+            # cleaned speech rather than special/control-token artifacts.
+            summary["raw_text"] = sanitize_asr_text(text, final=True)
+            return summary
+
+        automatic = decode("auto")
+        assessment = assess_verification(candidate, automatic)
+        if not assessment.verified and reason == "short_outro":
+            alternative = assess_verification(candidate, automatic, require_agreement=False)
+            if alternative.verified:
+                # A different wording/language needs another acoustic decode
+                # forced to the independently detected language. Never infer
+                # the source language from Latin characters alone.
+                confirmation = decode(alternative.language)
+                assessment = assess_verification(alternative.text, confirmation, require_auto=False,
+                                                   expected_language=alternative.language)
+        if not assessment.verified:
+            raise ValueError(assessment.reason)
+        verification.update(status="verified", source_language=assessment.language)
+        last_asr_diagnostics["verified_source_language"] = assessment.language
+        if assessment.language != source_language_code():
+            last_asr_diagnostics.setdefault("consistency_issues", []).append("verified_language_switch")
+        last_asr_diagnostics["primary_decoder"] = primary
+        return assessment.text
+    except Exception as exc:
+        verification["error"] = f"{type(exc).__name__}: {exc}"
+        last_asr_diagnostics.setdefault("consistency_issues", []).append("final_verification_unresolved")
+        last_asr_diagnostics.setdefault("preview_evidence", candidate)
+        return ""
+    finally:
+        if verification["status"] != "verified":
+            last_decoder_quality.clear()
+            last_decoder_quality.update(primary)
+
+
+def result_source_language(result: AsrResult) -> str:
+    verification = result.diagnostics.get("final_verification", {})
+    code = result.diagnostics.get("verified_source_language")
+    if verification.get("status") == "verified" and isinstance(code, str) and code in LANGUAGE_SPECS:
+        return code
+    return source_language_code()
+
+
+def recover_inconsistent_final(text: str, preview: str, *, reason: str = "preview_disagreement") -> str:
+    """One bounded acoustic retry; never substitute an earlier hypothesis."""
+    primary = deepcopy(last_decoder_quality)
+    recovery = {"status": "unresolved", "reason": reason, "primary_text": text, "windows": []}
+    last_asr_diagnostics["final_recovery"] = recovery
+    try:
+        if effective_lane_backend(False) != "mlx-whisper" or last_prepared_audio is None:
+            raise ValueError("Timestamped recovery is unavailable for this decoder/input")
+        windows = recovery_windows(int(last_prepared_audio.size), SAMPLE_RATE)
+        summaries = []
+        for window in windows:
+            # Reuse the exact prepared input: no new capture, normalization or
+            # prompt from earlier text. This runs in the existing ASR worker.
+            part = last_prepared_audio[window.start_sample:window.end_sample]
+            decoded = transcribe_audio_mlx_whisper(part, model_name=effective_lane_model(False),
+                                                  beam=effective_lane_beam(False), word_timestamps=True)
+            summary = deepcopy(last_decoder_quality)
+            summaries.append(summary)
+            recovery["windows"].append({"start_sample": window.start_sample, "end_sample": window.end_sample,
+                "core_start_sample": window.core_start_sample, "core_end_sample": window.core_end_sample,
+                "decoder": summary})
+            if not sanitize_asr_text(decoded, final=True):
+                raise ValueError("A recovery window returned no usable speech")
+            if not any(segment.get("words") for segment in summary.get("segments", [])):
+                raise ValueError("A recovery window returned no word alignment")
+            if decoder_repetition_loop(decoded, summary.get("max_compression_ratio")):
+                raise ValueError("A recovery window entered a decoder repetition loop")
+        stitched = stitch_recovery(windows, summaries, SAMPLE_RATE)
+        if not stitched.valid:
+            raise ValueError(stitched.error)
+        recovered = sanitize_asr_language_shape(sanitize_asr_text(stitched.text, final=True), final=True)
+        if (not recovered or final_preview_disagrees(recovered, preview, last_prepared_audio.size / SAMPLE_RATE)
+                or outro_conflicts_with_preview(recovered, preview)):
+            raise ValueError("Recovered speech still contradicts the substantial preview")
+        segments = []
+        for window, summary in zip(windows, summaries):
+            offset = window.start_sample / SAMPLE_RATE
+            for segment in summary.get("segments", []):
+                segment = deepcopy(segment)
+                for field in ("start", "end"):
+                    if segment.get(field) is not None:
+                        segment[field] += offset
+                for word in segment.get("words", []):
+                    word["start"] += offset
+                    word["end"] += offset
+                segments.append(segment)
+        last_decoder_quality.clear()
+        last_decoder_quality.update(summarize_whisper_result(
+            {"text": recovered, "language": primary.get("detected_language"), "segments": segments}))
+        last_asr_diagnostics["primary_decoder"] = primary
+        recovery["status"] = "recovered"
+        return recovered
+    except Exception as exc:
+        recovery["error"] = f"{type(exc).__name__}: {exc}"
+        last_asr_diagnostics.setdefault("consistency_issues", []).append("final_recovery_unresolved")
+        return ""
+    finally:
+        if recovery["status"] != "recovered":
+            last_decoder_quality.clear()
+            last_decoder_quality.update(primary)
+
+
 def transcribe_pcm_i16(audio_i16: np.ndarray, *, from_ring: bool = False, partial: bool = False) -> str:
     global last_prepared_audio
     audio_i16 = np.ascontiguousarray(audio_i16, dtype=np.int16)
@@ -5897,10 +6092,21 @@ def transcribe_pcm_i16(audio_i16: np.ndarray, *, from_ring: bool = False, partia
         last_asr_diagnostics["processing_seconds"] = time.perf_counter() - started
         retain_asr_evidence(audio_i16, "", error=f"{type(exc).__name__}: {exc}")
         raise
-    last_asr_diagnostics["processing_seconds"] = time.perf_counter() - started
+    last_asr_diagnostics["primary_processing_seconds"] = time.perf_counter() - started
     identity = asr_request_context.get("utterance_id")
+    verified_foreign_source = False
+    if not partial and identity is not None and effective_lane_backend(False) == "mlx-whisper":
+        raw_candidate = sanitize_asr_text(str(last_decoder_quality.get("raw_text", "")), final=True)
+        filtered_language = bool(not text and raw_candidate and not sanitize_asr_language_shape(raw_candidate, final=True))
+        short_outro = audio_i16.size <= 6 * SAMPLE_RATE and is_outro_candidate(text)
+        if filtered_language or short_outro:
+            text = verify_final_audio(raw_candidate or text, reason="foreign_script" if filtered_language else "short_outro")
+            verified_foreign_source = bool(text and last_asr_diagnostics.get("verified_source_language") != source_language_code())
     if identity is not None:
         if partial:
+            if outro_conflicts_with_preview(text, asr_preview_evidence.get(identity, "")):
+                last_asr_diagnostics["consistency_issues"] = ["partial_outro_conflict"]
+                text = ""
             if (text and not is_repetitive_text(text)
                     and (last_decoder_quality.get("max_compression_ratio") or 0) <= 2.9
                     and (last_decoder_quality.get("max_no_speech_prob") or 0) <= 0.6
@@ -5910,9 +6116,18 @@ def transcribe_pcm_i16(audio_i16: np.ndarray, *, from_ring: bool = False, partia
                     asr_preview_evidence.pop(next(iter(asr_preview_evidence)))
         else:
             preview = asr_preview_evidence.pop(identity, "")
-            if final_preview_disagrees(text, preview, audio_i16.size / SAMPLE_RATE):
+            unresolved_verification = last_asr_diagnostics.get("final_verification", {}).get("status") == "unresolved"
+            looping_final = decoder_repetition_loop(text, last_decoder_quality.get("max_compression_ratio"))
+            if not unresolved_verification and looping_final:
+                last_asr_diagnostics.setdefault("consistency_issues", []).append("decoder_repetition_loop")
+                last_asr_diagnostics["preview_evidence"] = preview
+                text = recover_inconsistent_final(text, preview, reason="decoder_repetition_loop")
+            elif (not unresolved_verification and not verified_foreign_source and (final_preview_disagrees(text, preview, audio_i16.size / SAMPLE_RATE)
+                    or (audio_i16.size >= 6 * SAMPLE_RATE and outro_conflicts_with_preview(text, preview)))):
                 last_asr_diagnostics["consistency_issues"] = ["final_preview_disagreement"]
                 last_asr_diagnostics["preview_evidence"] = preview
+                text = recover_inconsistent_final(text, preview)
+    last_asr_diagnostics["processing_seconds"] = time.perf_counter() - started
     retain_asr_evidence(audio_i16, text)
     return text
 
@@ -6005,6 +6220,8 @@ asr_results: Queue[AsrResult] = Queue(maxsize=max(1, args.audio_queue_size * 2))
 mt_tasks: PriorityQueue[PrioritizedTranslationTask] = PriorityQueue(maxsize=max(1, args.inference_queue_size))
 tts_tasks: Queue[TtsTask] = Queue(maxsize=max(16, args.tts_queue_size))
 shutdown_event = threading.Event()
+session_draining_event = threading.Event()
+session_drain_started_at: float | None = None
 tts_playing = threading.Event()
 mt_revision_lock = threading.Lock()
 latest_enqueued_audio_revision: dict[int, int] = {}
@@ -6067,11 +6284,13 @@ current_partial_locked_ratio = 0.0
 current_partial_revision = 0
 current_partial_utterance_id: int | None = None
 current_partial_state_lock = threading.RLock()
+current_partial_timing = PartialTextTiming()
 
 
 def reset_current_partial_state(utterance_id: int | None = None, *, next_utterance_id: int | None = None) -> None:
     global current_partial_text, current_partial_display_text, current_partial_display_locked_prefix
     global current_partial_stability, current_partial_last_change_ms, current_partial_locked_prefix, current_partial_locked_ratio, current_partial_revision, current_partial_utterance_id
+    global current_partial_timing
     with current_partial_state_lock:
         if utterance_id is not None and current_partial_utterance_id not in {None, utterance_id}:
             return
@@ -6084,17 +6303,32 @@ def reset_current_partial_state(utterance_id: int | None = None, *, next_utteran
         current_partial_locked_ratio = 0.0
         current_partial_revision = 0
         current_partial_utterance_id = next_utterance_id
+        current_partial_timing = PartialTextTiming()
 
 
-def partial_endpoint_snapshot(utterance_id: int) -> tuple[str, int, float, float]:
-    """Take one coherent endpoint hint, excluding another utterance's results."""
+def partial_endpoint_observation(utterance_id: int, *, captured_until_ns: int | None = None) -> tuple[str, int, float, float, int | None]:
+    """Read text, stability and its source coverage as one atomic observation."""
     with current_partial_state_lock:
         if current_partial_utterance_id != utterance_id:
-            return "", 0, 0.0, 0.0
+            return "", 0, 0.0, 0.0, None
+        age = None
+        coverage = None
+        if current_partial_timing.text == current_partial_text:
+            age = current_partial_timing.age_ms(time.monotonic(), captured_until_ns)
+            coverage = current_partial_timing.capture_end_ns
         return (
             current_partial_text, current_partial_stability,
-            current_partial_last_change_ms, current_partial_locked_ratio,
+            current_partial_last_change_ms if age is None else age, current_partial_locked_ratio,
+            coverage,
         )
+
+
+def partial_endpoint_snapshot(utterance_id: int, *, captured_until_ns: int | None = None) -> tuple[str, int, float, float]:
+    return partial_endpoint_observation(utterance_id, captured_until_ns=captured_until_ns)[:4]
+
+
+def partial_endpoint_capture_end(utterance_id: int) -> int | None:
+    return partial_endpoint_observation(utterance_id)[4]
 
 
 def enqueue_translation_task(task: TranslationTask) -> bool:
@@ -6490,6 +6724,10 @@ def process_capture_frame(pcm: bytes) -> None:
 
     with audio_lock:
         if speech:
+            if in_speech and silence_ms:
+                pause_ewma_ms = completed_pause_estimate(pause_ewma_ms, silence_ms,
+                    base_ms=args.silence_base_ms, maximum_ms=args.silence_max_ms, alpha=args.adapt_alpha)
+            silence_ms = 0
             if not in_speech:
                 trace_update(utterance_seq, speech_started_at=time.perf_counter())
                 active_frames.extend(pre_roll)
@@ -6512,7 +6750,6 @@ def process_capture_frame(pcm: bytes) -> None:
                 hangover_ms -= FRAME_MS
             else:
                 silence_ms += FRAME_MS
-                pause_ewma_ms = (1.0 - args.adapt_alpha) * pause_ewma_ms + args.adapt_alpha * float(silence_ms)
                 endpoint_text, endpoint_stability, endpoint_last_change, endpoint_locked_ratio = partial_endpoint_snapshot(utterance_seq)
                 adaptive_silence_ms = compute_adaptive_threshold(pause_ewma_ms, speech_run_ms)
                 adaptive_silence_ms = semantic_endpoint_threshold(adaptive_silence_ms, endpoint_text)
@@ -6607,13 +6844,14 @@ def record_asr_decision(result: AsrResult, text: str, decision: str, reason: str
     payload = {
         "timestamp": datetime.now(timezone.utc).isoformat(), "session_id": runtime_session_id,
         "utterance_id": result.utterance_id, "request_id": result.request_id,
-        "decision": decision, "reason": reason, "source_language": source_language_code(),
+        "decision": decision, "reason": reason, "source_language": result_source_language(result),
         "text": str(text)[:16000], "raw_text": raw_text[:16000],
         "text_truncated": len(str(text)) > 16000 or len(raw_text) > 16000,
         "request": diagnostics.get("request", {}), "issues": diagnostics.get("issues", []),
         "decoder_quality": {key: decoder.get(key) for key in (
             "mean_avg_logprob", "min_avg_logprob", "max_no_speech_prob", "max_compression_ratio",
-            "requested_beam", "effective_beam", "detected_language")},
+            "requested_beam", "effective_beam", "detected_language", "language_auto_detected")},
+        "verification_status": diagnostics.get("final_verification", {}).get("status"),
         "processing_seconds": diagnostics.get("processing_seconds"),
     }
     try:
@@ -6774,8 +7012,7 @@ def receive_asr_stage_result(result: AsrResult) -> None:
     if evidence and (not evidence.get("raw_accepted", True) or not evidence.get("model_input_accepted", True)):
         ui_update(status="⚠️ Audio review storage limit reached or writer unavailable; check this session's recording summary")
     quality = result.diagnostics.get("decoder", {})
-    if (result.partial and (quality.get("max_compression_ratio") or 0) > 2.9
-            and is_repetitive_text(result.text)):
+    if result.partial and decoder_repetition_loop(result.text, quality.get("max_compression_ratio")):
         # A pathological preview loop is not useful live text or MT input.
         # Retain its diagnostic audio and wait for authoritative final ASR.
         record_asr_decision(result, result.text, "partial_review_only", "Repetitive high-compression preview held for final decoding")
@@ -6880,6 +7117,8 @@ def update_capture_status(feeder: RingAudioFeeder) -> None:
         level = getattr(feeder.endpoint, "last_dbfs", -100.0)
         speech = "speech" if feeder.endpoint.in_speech else "silence"
         state, detail = "listening", f"{received:.1f}s received | {level:.0f} dBFS | {speech} | dropped {feeder.dropped_samples} samples"
+    if resolved_capture_input:
+        detail = f"{resolved_capture_input['name']!r} (index {resolved_capture_input['index']}) | {detail}"
     if audio_evidence is not None:
         recording = audio_evidence.snapshot
         if recording["error"] or recording["rejected_capture_samples"] or recording["rejected_artifacts"]:
@@ -7056,6 +7295,8 @@ def coordinator_worker() -> None:
         "skipped_incomplete": 0,
         "skipped_unchanged": 0,
         "skipped_too_short": 0,
+        "skipped_busy": 0,
+        "rejected": 0,
         "stale_candidate_removed": 0,
     }
     partial_mt_last_debug_at = 0.0
@@ -7095,7 +7336,8 @@ def coordinator_worker() -> None:
         watchdog_forced_final_by_utt.discard(utterance_id)
         watchdog_closed_by_utt.discard(utterance_id)
 
-    def watchdog_close_utterance(utterance_id: int, reason: str) -> None:
+    def watchdog_close_utterance(utterance_id: int, reason: str, *, review_text: str = "",
+                                 review_timing: dict | None = None) -> None:
         partial_cache.pop(utterance_id, None)
         partial_source_spans.pop(utterance_id, None)
         partial_display_cache.pop(utterance_id, None)
@@ -7108,6 +7350,18 @@ def coordinator_worker() -> None:
         reset_current_partial_state(utterance_id)
         trace_drop(utterance_id)
         with ui_lock:
+            if review_text:
+                entry = deepcopy(ui_state["left_active"].get(utterance_id, make_panel_entry()))
+                preview = entry.get("source_preview")
+                if not isinstance(preview, dict) or not preview.get("text"):
+                    preview = source_preview(review_text, "", inflight=False)
+                entry.update(entry_id=utterance_id, src_final=False, dst_final=False,
+                             source_preview={**preview, "inflight": False},
+                             review_required=True, review_reason=reason)
+                entry["src"] = format_partial_transcript_for_ui(preview["text"], preview.get("stable", ""))
+                if review_timing:
+                    update_entry_audio_timing(entry, review_timing, final=True)
+                ui_state["left_done"].append(entry)
             ui_remove_panel_entry("left", utterance_id)
             render_dashboard()
         if args.debug:
@@ -7155,29 +7409,21 @@ def coordinator_worker() -> None:
     ) -> None:
         previous = partial_translation_candidates.get(utterance_id)
         stable_text = selected_partial_translation_source(text, locked_prefix)
-        previous_stable_text = previous.stable_text if previous is not None else ""
-        stable_changed_at = (
-            previous.stable_changed_at
-            if previous is not None and previous_stable_text == stable_text
-            else now
-        )
-        last_sent_text = ""
-        if previous is not None and stable_text.startswith(previous.last_sent_text):
-            last_sent_text = previous.last_sent_text
-        partial_translation_candidates[utterance_id] = PartialTranslationCandidate(
+        partial_translation_candidates[utterance_id] = update_candidate(
+            previous,
             text=text,
             locked_prefix=locked_prefix,
             revision=revision,
             stable_text=stable_text,
-            stable_changed_at=stable_changed_at,
-            last_sent_text=last_sent_text,
+            now=now,
+            batch_stable_prefix=args.partial_translation_policy == "stable" or args.translation_stable_only,
         )
 
     def choose_stable_partial_translation_text(candidate: PartialTranslationCandidate) -> str:
         return partial_translation_clump(candidate.stable_text)
 
     def sweep_partial_translations() -> None:
-        if not args.stream_audio_translation or args.partial_translation_policy == "off":
+        if session_draining_event.is_set() or not args.stream_audio_translation or args.partial_translation_policy == "off":
             return
         quiet_seconds = max(0.0, float(args.partial_translation_stabilize_seconds))
         min_initial_words = max(1, int(args.stable_translation_min_words))
@@ -7194,7 +7440,7 @@ def coordinator_worker() -> None:
                 count_partial_mt("skipped_unchanged" if translation_text else "skipped_incomplete")
                 maybe_log_partial_mt_counters()
                 continue
-            if now - candidate.stable_changed_at < quiet_seconds:
+            if not candidate.ready(now, quiet_seconds):
                 count_partial_mt("skipped_unstable")
                 maybe_log_partial_mt_counters()
                 continue
@@ -7211,11 +7457,29 @@ def coordinator_worker() -> None:
                 maybe_log_partial_mt_counters()
                 continue
 
-            count_partial_mt("queued")
-            maybe_log_partial_mt_counters(force=True)
-            candidate.last_sent_text = translation_text
-            stable_translation_cache[utterance_id] = translation_text
-            enqueue_translation_task(
+            if not candidate.needs_refresh(translation_text, now, min_delta_words=min_delta_words,
+                                           interval=quiet_seconds):
+                count_partial_mt("skipped_small_growth")
+                maybe_log_partial_mt_counters()
+                continue
+            with final_asr_pending_lock:
+                final_asr_waiting = bool(final_asr_pending_utterances)
+            if asr_stage is not None:
+                asr_snapshot = asr_stage.snapshot
+                final_asr_waiting = final_asr_waiting or bool(asr_snapshot.get("committed_pending", 0)
+                    or (asr_snapshot.get("inflight") is not None and not asr_snapshot.get("inflight_partial")))
+            if final_asr_waiting:
+                count_partial_mt("skipped_asr_final_busy")
+                maybe_log_partial_mt_counters()
+                continue
+            if translation_stage is not None:
+                snapshot = translation_stage.snapshot
+                if (snapshot.get("state") in {"new", "loading", "failed", "closed"} or snapshot.get("committed_pending", 0)
+                        or snapshot.get("inflight_partial") or snapshot.get("partials_pending", 0)):
+                    count_partial_mt("skipped_busy")
+                    maybe_log_partial_mt_counters()
+                    continue
+            accepted = enqueue_translation_task(
                 TranslationTask(
                     source="audio",
                     text=translation_text,
@@ -7228,9 +7492,17 @@ def coordinator_worker() -> None:
                     revision=candidate.revision,
                 )
             )
+            if accepted:
+                candidate.admitted(translation_text, now)
+                stable_translation_cache[utterance_id] = translation_text
+                count_partial_mt("queued")
+                maybe_log_partial_mt_counters(force=True)
+            else:
+                count_partial_mt("rejected")
+                maybe_log_partial_mt_counters()
 
     def sweep_stuck_partials() -> None:
-        if not args.stuck_partial_watchdog:
+        if session_draining_event.is_set() or not args.stuck_partial_watchdog:
             return
         timeout_s = max(0.5, args.stuck_partial_timeout_ms / 1000.0)
         now = time.perf_counter()
@@ -7348,12 +7620,10 @@ def coordinator_worker() -> None:
                     locked_ratio = (len(locked_prefix_words) / max(1, len(cur_words))) if cur_words else 0.0
                 if previous_text and not materially_changed:
                     stability_boost = 2 if similarity >= 0.9 and changed_tail_words <= 1 else 1
-                    _text, previous_stability, previous_last_change, _ratio = partial_endpoint_snapshot(result.utterance_id)
+                    _text, previous_stability, _previous_age, _ratio = partial_endpoint_snapshot(result.utterance_id)
                     partial_stability = min(8, previous_stability + stability_boost)
-                    partial_last_change_ms = previous_last_change + max(1, FRAME_MS * stability_boost)
                 else:
                     partial_stability = 0 if not previous_text else 1
-                    partial_last_change_ms = 0.0
                 if args.debug and previous_text:
                     log_debug(
                         f"partial similarity={similarity:.2f} prefix_words={prefix_words} overlap_words={overlap_words} locked_ratio={locked_ratio:.2f} changed_tail={changed_tail_words} stability={partial_stability}"
@@ -7383,6 +7653,9 @@ def coordinator_worker() -> None:
                 # atomic with this complete publication.
                 with current_partial_state_lock:
                     if current_partial_utterance_id is None or result.utterance_id >= current_partial_utterance_id:
+                        capture_end = current_span[3] if current_span is not None else None
+                        current_partial_timing.update(partial_text, capture_end, time.monotonic())
+                        partial_last_change_ms = current_partial_timing.age_ms(time.monotonic(), capture_end) or 0.0
                         current_partial_text = partial_text
                         current_partial_display_text = display_text
                         current_partial_display_locked_prefix = display_locked_prefix
@@ -7416,6 +7689,24 @@ def coordinator_worker() -> None:
                     else:
                         partial_translation_candidates.pop(result.utterance_id, None)
                     sweep_partial_translations()
+                continue
+
+            # Defense at the publication boundary as well as in the decoder:
+            # a legacy/unverified result must not bypass acoustic recovery.
+            if (decoder_repetition_loop(result.text, result.diagnostics.get("decoder", {}).get("max_compression_ratio"))
+                    and result.diagnostics.get("final_recovery", {}).get("status") != "recovered"):
+                result.diagnostics["final_recovery"] = {"status": "unresolved", "reason": "decoder_repetition_loop",
+                    "error": "Decoder loop reached publication without a verified acoustic recovery"}
+            if (result.diagnostics.get("final_recovery", {}).get("status") == "unresolved"
+                    or result.diagnostics.get("final_verification", {}).get("status") == "unresolved"):
+                if result.utterance_id not in finalized_utterances:
+                    retained = previous_text or result.diagnostics.get("preview_evidence", "")
+                    record_asr_decision(result, "", "unresolved_final", "Acoustic verification could not verify the final transcript")
+                    finalized_utterances.add(result.utterance_id)
+                    watchdog_close_utterance(result.utterance_id, "Final recognition needs review", review_text=retained,
+                        review_timing=capture_clip_timing(result.diagnostics.get("request", {}), audio_wall_clock_offset_ns))
+                    detail = "provisional text retained" if retained else "no reliable text; see saved audio"
+                    ui_update(status=f"⚠️ Phrase {result.utterance_id}: final recognition needs review; {detail}")
                 continue
 
             final_text = prepare_final_transcript_for_translation(result.text or "", previous_text)
@@ -7453,6 +7744,7 @@ def coordinator_worker() -> None:
                 continue
 
             revision = revision_cache.get(result.utterance_id, 0) + 1
+            actual_source = result_source_language(result)
             revision_cache[result.utterance_id] = revision
             trace_update(result.utterance_id, asr_final_at=final_seen_at)
             partial_cache.pop(result.utterance_id, None)
@@ -7466,17 +7758,19 @@ def coordinator_worker() -> None:
             note_recent_final_transcript(result.utterance_id, final_text, final_audio_span, final_seen_at)
             reset_current_partial_state(result.utterance_id)
             with ui_lock:
-                ui_set_panel_entry("left", result.utterance_id, "src", f"🗣️ {source_label()}: {color_left_tr(final_text)}", final=True, revision=revision,
-                                   audio_timing=capture_clip_timing(result.diagnostics.get("request", {}), audio_wall_clock_offset_ns))
+                ui_set_panel_entry("left", result.utterance_id, "src", f"🗣️ {actual_source}: {color_left_tr(final_text)}", final=True, revision=revision,
+                                   audio_timing=capture_clip_timing(result.diagnostics.get("request", {}), audio_wall_clock_offset_ns),
+                                   source_language_override=actual_source)
                 render_dashboard()
             with session_log_lock:
                 audio_final_transcripts[result.utterance_id] = final_text
+                audio_final_source_languages[result.utterance_id] = actual_source
             record_asr_decision(result, final_text, "accepted_final")
             translation_accepted = enqueue_translation_task(
                 TranslationTask(
                     source="audio",
                     text=final_text,
-                    src_lang=source_nllb_lang(),
+                    src_lang=language_spec(actual_source).nllb,
                     beams=max(1, args.mt_beams),
                     target_lang=target_language_code(),
                     forced_bos_id=forced_bos_for_target(target_language_code()),
@@ -8742,6 +9036,7 @@ def web_state_snapshot() -> dict:
     return build_web_snapshot(ui_state, {
         "source_language": source_language_code(), "target_language": target_language_code(),
         "input_device": args.input_device, "debug": args.debug, "mode": args.mode,
+        "resolved_input_device": resolved_capture_input,
         "audio_review": args.audio_review,
     }, session_id=runtime_session_id, running=not shutdown_event.is_set(),
         audio_review_mode=audio_review_mode, recording_directory=str(runtime_audio_dir or ""))
@@ -8837,9 +9132,141 @@ def read_headless_command(timeout: float) -> str | None:
     if headless_transport is not None and headless_transport.poll(timeout):
         if headless_transport.snapshot.get("output_failed"):
             raise RuntimeError("Web output channel stalled, overflowed or failed; restart the session after reconnecting")
-        shutdown_event.set()
+        request_session_drain()
         return "\x1b"
     return None
+
+
+def request_session_drain() -> None:
+    """Stop admission without stopping the consumers needed to finish finals."""
+    global session_drain_started_at
+    if not session_draining_event.is_set():
+        session_drain_started_at = time.monotonic()
+        session_draining_event.set()
+
+
+def _drain_queue_count(queue) -> int:
+    if queue is None:
+        return 0
+    with queue.mutex:
+        return int(queue.unfinished_tasks)
+
+
+def session_drain_snapshot(feeder=None) -> dict:
+    with final_asr_pending_lock:
+        pending_finals = sorted(final_asr_pending_utterances)
+    with ui_lock:
+        unfinished_source = []
+        unfinished_translation = []
+        for side in ("left", "right"):
+            for uid, entry in ui_state[f"{side}_active"].items():
+                preview = entry.get("source_preview")
+                has_source = bool(preview.get("text")) if preview is not None else bool(entry.get("src"))
+                if not has_source:
+                    continue
+                if not entry.get("src_final"):
+                    unfinished_source.append(uid)
+                elif not entry.get("dst_final"):
+                    unfinished_translation.append(f"{side}:{uid}")
+    stages = {}
+    for name, stage in (("asr", asr_stage), ("translation", translation_stage)):
+        if stage is not None:
+            snapshot = stage.snapshot
+            stages[name] = {"state": snapshot.get("state", "unknown"),
+                            "committed_pending": snapshot.get("committed_pending", snapshot.get("pending", 0)),
+                            "inflight": bool(snapshot.get("inflight") is not None and not snapshot.get("inflight_background")),
+                            "pending_callbacks": snapshot.get("pending_callbacks", 0)}
+    queues = {name: _drain_queue_count(queue) for name, queue in (
+        ("capture", capture_frames), ("audio", audio_tasks), ("asr_results", asr_results),
+        ("translation", mt_tasks), ("translation_results", translation_stage_results),
+    )}
+    if ring_scheduler is not None:
+        queues["ring_asr"] = _drain_queue_count(ring_scheduler.q)
+    thread = getattr(feeder, "worker_thread", None)
+    return {"pending_final_asr": pending_finals, "unfinished_source": unfinished_source,
+            "unfinished_translation": unfinished_translation, "queues": queues, "stages": stages,
+            "capture_draining": bool(thread and thread.is_alive())}
+
+
+def _flush_final_logs_on_stop() -> None:
+    with session_log_lock:
+        pending = [(uid, value) for uid, value in pending_audio_translation_logs.items()
+                   if uid not in logged_audio_translation_utterances]
+        pending_audio_translation_logs.clear()
+        logged_audio_translation_utterances.update(uid for uid, _value in pending)
+    for uid, (_revision, source, translation) in pending:
+        log_final_transcription(uid, source, translation)
+
+
+def _report_session_drain(report: dict) -> None:
+    if runtime_session_dir is not None:
+        (runtime_session_dir / "shutdown-drain.json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    if report["status"] == "completed":
+        detail = "Stopped: final transcription and translation finished."
+    else:
+        detail = f"Stopped with unfinished text work ({report['reason']}); provisional text retained. See shutdown-drain.json."
+    ui_update(status=detail)
+
+
+def drain_session_work(feeder=None, *, timeout: float | None = None) -> dict:
+    """Flush captured tail, then let committed text work finish within a budget."""
+    request_session_drain()
+    started = session_drain_started_at if session_drain_started_at is not None else time.monotonic()
+    budget = args.shutdown_grace_seconds if timeout is None else max(0.0, float(timeout))
+    deadline = started + budget
+    update_stage_status("capture", "stopping", "Finishing the captured phrase; audio input is closed")
+    if feeder is not None and not feeder.closed:
+        feeder.close()
+    legacy_flush = feeder is None and args.mode in {"audio", "both"} and resolve_streaming_engine() == "legacy"
+    quiet_since = None
+    status, reason = "timeout", "grace period expired"
+    while True:
+        snapshot = session_drain_snapshot(feeder)
+        if legacy_flush and snapshot["queues"]["capture"] == 0:
+            force_flush_audio()
+            legacy_flush = False
+            snapshot = session_drain_snapshot(feeder)
+        text_pending = bool(snapshot["pending_final_asr"] or snapshot["unfinished_source"] or snapshot["unfinished_translation"])
+        work_pending = bool(snapshot["capture_draining"] or any(snapshot["queues"].values())
+                            or any(stage["committed_pending"] or stage["inflight"] or stage["pending_callbacks"]
+                                   for stage in snapshot["stages"].values()))
+        unavailable = [name for name, stage in snapshot["stages"].items()
+                       if stage["state"] in {"loading", "failed", "closed"}
+                       and (stage["committed_pending"] or (text_pending and name == "asr" and (snapshot["unfinished_source"] or snapshot["pending_final_asr"]))
+                            or (text_pending and name == "translation" and snapshot["unfinished_translation"]))]
+        now = time.monotonic()
+        if unavailable:
+            status, reason = "unavailable", "worker not ready: " + ", ".join(unavailable)
+            break
+        if not text_pending and not work_pending and not legacy_flush:
+            quiet_since = quiet_since if quiet_since is not None else now
+            if budget == 0 or now - quiet_since >= 0.1:
+                status, reason = "completed", "accepted final text work drained"
+                break
+        else:
+            quiet_since = None
+        if now >= deadline or shutdown_event.is_set():
+            break
+        time.sleep(min(0.02, deadline - now))
+    _flush_final_logs_on_stop()
+    report = {"status": status, "reason": reason, "elapsed_seconds": round(max(0.0, time.monotonic() - started), 3),
+              "grace_seconds": budget, "pending": snapshot}
+    if status != "completed":
+        if args.session_logs:
+            with ui_lock:
+                report["retained_text"] = [{"side": side, "utterance_id": uid,
+                    "source": strip_for_log(entry.get("src", "")), "translation": strip_for_log(entry.get("dst", "")),
+                    "source_final": bool(entry.get("src_final")), "translation_final": bool(entry.get("dst_final"))}
+                    for side in ("left", "right") for uid, entry in ui_state[f"{side}_active"].items()
+                    if not placeholder_only_entry(entry)]
+        if audio_evidence is not None:
+            with pending_stage_asr_lock:
+                pending_audio = list(pending_audio_evidence.values())
+            for pcm, metadata in pending_audio:
+                audio_evidence.save_clip(pcm, {**metadata, "shutdown_reason": reason}, ["shutdown_drain_incomplete"],
+                                         label=metadata.get("request_id", "shutdown-tail"))
+    _report_session_drain(report)
+    return report
 
 
 def run_web_interface() -> int:
@@ -8858,6 +9285,7 @@ def run_web_interface() -> int:
             continue
         forwarded.append(token)
     controller = WebController(core_path=Path(__file__).resolve(), python_executable=sys.executable,
+                               stop_timeout=max(10.0, args.shutdown_grace_seconds + 4.0),
                                core_arguments=forwarded,
                                initial_config={"source_language": source_language_code(),
                                                "target_language": target_language_code(),
@@ -8878,7 +9306,8 @@ def run_web_interface() -> int:
 
 
 def main() -> int:
-    global audio_bridge, text_entry_seq, detected_stt_backend, detected_stt_device, active_ring_feeder
+    global audio_bridge, text_entry_seq, detected_stt_backend, detected_stt_device, active_ring_feeder, session_drain_started_at
+    global resolved_capture_input
     if args.self_test:
         return run_self_test()
     if args.list_devices:
@@ -8892,14 +9321,20 @@ def main() -> int:
     if args.ui == "web":
         return run_web_interface()
 
+    session_draining_event.clear()
+    session_drain_started_at = None
     validate_runtime_configuration()
 
     if args.mode in {"audio", "both"}:
         ensure_audio_runtime()
     capture_input = None
+    resolved_capture_input = None
     if args.mode in {"audio", "both"} and resolve_audio_io_backend() == "sounddevice":
         capture_input = checked_input_device(sd, sounddevice_input_device(),
                                              samplerate=SAMPLE_RATE, channels=CHANNELS, dtype=DTYPE)
+        resolved_capture_input = describe_input_device(capture_input, sounddevice_input_device(),
+            samplerate=SAMPLE_RATE, channels=CHANNELS, dtype=DTYPE,
+            default_index=getattr(getattr(sd, "default", None), "device", (None,))[0])
     initialize_session_runtime()
 
     streaming_engine = resolve_streaming_engine() if args.mode in {"audio", "both"} else "legacy"
@@ -8981,6 +9416,7 @@ def main() -> int:
                         render_input(text_buffer, active=False)
                         ui_update(status="↩️ Text input cancelled.")
                         return True
+                    request_session_drain()
                     return False
                 if key in ("\n", "\r"):
                     if text_buffer.strip():
@@ -9034,7 +9470,6 @@ def main() -> int:
                                 break
                             if not handle_interactive_key(0.05):
                                 break
-                ring_feeder = None
                 active_ring_feeder = None
             else:
                 if audio_backend in {"apple-raw", "apple-vpio"}:
@@ -9062,6 +9497,7 @@ def main() -> int:
                 if key is None:
                     continue
                 if key == "\x1b":
+                    request_session_drain()
                     break
                 if key in ("\n", "\r"):
                     if text_buffer.strip():
@@ -9077,10 +9513,25 @@ def main() -> int:
                     text_buffer += key
                     render_input(text_buffer)
     finally:
+        drain_report = None
+        exit_type = sys.exc_info()[0]
+        if not shutdown_event.is_set() and exit_type in {None, KeyboardInterrupt}:
+            try:
+                timeout = min(args.shutdown_grace_seconds, 1.0) if exit_type is KeyboardInterrupt else None
+                drain_report = drain_session_work(ring_feeder, timeout=timeout)
+            except KeyboardInterrupt:
+                eprint("Stop drain interrupted; unfinished provisional text and saved audio retained.")
+            except Exception as exc:
+                eprint(f"Stop drain failed; continuing bounded worker cleanup: {type(exc).__name__}: {exc}")
         shutdown_event.set()
         stop_asr_process()
         stop_mt_process()
         prune_empty_source_placeholders(force=True)
+        if drain_report is not None:
+            try:
+                _report_session_drain(drain_report)
+            except Exception as exc:
+                eprint(f"Unable to report Stop drain: {type(exc).__name__}: {exc}")
         audio_bridge = None
         active_ring_feeder = None
         if audio_evidence is not None:

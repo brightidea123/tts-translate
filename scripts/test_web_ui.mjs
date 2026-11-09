@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { AutoScrollController, BoundedCache, SelectionTranslator, selectedMessage, messageIsFinal, inputSelectionAvailable, selectInputDevice, refreshInputOptions, sourcePreviewSegments, renderSourcePreview, formatPhraseTiming, renderPhraseTiming } from '../web/ui-interactions.js';
+import { AutoScrollController, BoundedCache, SelectionTranslator, selectedMessage, messageIsFinal, messageStatus, inputSelectionAvailable, selectInputDevice, refreshInputOptions, sourcePreviewSegments, renderSourcePreview, formatPhraseTiming, renderPhraseTiming } from '../web/ui-interactions.js';
 
 test('phrase timing uses captured start time and updates live/final clip seconds', () => {
   const start = '2026-11-08T05:10:23.698Z';
@@ -193,6 +193,22 @@ test('unfinished messages stay active until both source and translation are fina
   assert.equal(messageIsFinal({source_final: true, translation_final: false}), false);
   assert.equal(messageIsFinal({source_final: false, translation_final: true}), false);
   assert.equal(messageIsFinal({source_final: true, translation_final: true}), true);
+});
+
+test('unresolved final closes live activity while keeping recognition explicitly unverified', () => {
+  const item = { source_final: false, translation_final: false, source_stable: 'שלום',
+    source_inflight: false, review_required: true, review_reason: 'Final recognition needs review' };
+  assert.equal(messageIsFinal(item), false);
+  assert.deepEqual(messageStatus(item), { complete: true, reviewRequired: true,
+    label: 'Review needed', reason: 'Final recognition needs review' });
+  const env = previewEnvironment();
+  renderSourcePreview(env.content, item, 'שלום חברים', env.documentObject);
+  assert.equal(env.text(), 'שלום חברים');
+  assert.equal(env.content.children[1].className, 'transcript-provisional');
+  assert.equal(env.content.classList.contains('placeholder'), false);
+  assert.equal(messageStatus({ source_final: true, translation_final: false }).label, 'Translating');
+  assert.equal(messageStatus({ source_final: false }).label, 'Listening');
+  assert.equal(messageStatus({ source_final: true, translation_final: true }).label, 'Complete');
 });
 
 test('upward scroll turns follow off until explicitly checked again', () => {

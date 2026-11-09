@@ -125,6 +125,59 @@ class HeadlessTransportTests(unittest.TestCase):
 
 
 class WebSnapshotTests(unittest.TestCase):
+    def test_verified_entry_language_preserves_session_and_tooltip_directions(self):
+        ui = {
+            "left_done": [{"entry_id": 1, "src": "EN: words from a verified English insert",
+                           "dst": "AR: ترجمة", "source_language": "EN"},
+                          {"entry_id": 2, "src": "HE: שלום", "dst": "AR: مرحبا"}],
+            "left_active": {3: {"src": "EN~: another phrase", "source_language": "EN",
+                                "src_final": False}}, "left_order": [3],
+            "right_done": [{"entry_id": 4, "src": "AR: مرحبا", "dst": "HE: שלום"}],
+        }
+        config = {"source_language": "HE", "target_language": "AR"}
+        before = deepcopy(ui)
+        snapshot = build_web_snapshot(ui, config, "s", True, "full", None)
+        self.assertEqual([(item["source_language"], item["target_language"])
+                          for item in snapshot["transcript"]], [("EN", "AR"), ("HE", "AR"), ("EN", "AR")])
+        self.assertEqual((snapshot["replies"][0]["source_language"],
+                          snapshot["replies"][0]["target_language"]), ("AR", "HE"))
+        self.assertEqual(snapshot["config"], config)
+        self.assertEqual(ui, before)
+
+    def test_entry_language_override_requires_a_supported_canonical_code(self):
+        config = {"source_language": "HE", "target_language": "AR"}
+        for value in ["EN-US", "English", "en", " EN ", "", None, 3, {}, ["EN"], "<script>"]:
+            with self.subTest(value=value):
+                ui = {"left_done": [{"src": "text", "source_language": value}]}
+                before = deepcopy(ui)
+                item = build_web_snapshot(ui, config, "s", True, "full", None)["transcript"][0]
+                self.assertEqual((item["source_language"], item["target_language"]), ("HE", "AR"))
+                self.assertEqual(ui, before)
+        for value in ["AR", "HE", "DE", "TR", "FR", "RU", "EN", "ES"]:
+            with self.subTest(value=value):
+                item = build_web_snapshot({"left_done": [{"src": "text", "source_language": value}]},
+                                          config, "s", True, "full", None)["transcript"][0]
+                self.assertEqual(item["source_language"], value)
+                self.assertEqual(item["target_language"], "AR")
+
+    def test_unresolved_history_preserves_preview_without_claiming_final_recognition(self):
+        entry = {"entry_id": 5, "src": "HE~: earlier words", "dst": "", "src_final": False,
+                 "dst_final": False, "review_required": True,
+                 "review_reason": "\x1b[33mFinal recognition needs review\x1b[0m",
+                 "source_preview": {"text": "שלום חברים", "stable": "שלום", "inflight": False}}
+        ui = {"left_done": [entry]}
+        before = deepcopy(ui)
+        message = build_web_snapshot(ui, {"source_language": "HE", "target_language": "AR"}, "s", True, "issues", None)["transcript"][0]
+        self.assertEqual(message["source"], "שלום חברים")
+        self.assertEqual(message["source_stable"], "שלום")
+        self.assertEqual(message["source_provisional"], " חברים")
+        self.assertTrue(message["review_required"])
+        self.assertEqual(message["review_reason"], "Final recognition needs review")
+        self.assertFalse(message["source_final"])
+        self.assertFalse(message["translation_final"])
+        self.assertFalse(message["source_inflight"])
+        self.assertEqual(ui, before)
+
     def test_preview_sends_plain_words_with_stable_and_provisional_spans(self):
         ui = {"left_active": {1: {
             "src": "HE~: formatted terminal text", "src_final": False,

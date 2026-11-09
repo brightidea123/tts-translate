@@ -80,7 +80,7 @@ class SelectionInferenceTests(unittest.TestCase):
         self.assertTrue(scheduler.submit(3, pcm, partial=False))
         self.assertFalse(core.asr_stage.submit.call_args.kwargs["partial"])
 
-    def test_confident_collapsed_final_is_saved_as_issue_without_substituting_preview_words(self):
+    def test_collapsed_final_without_recovery_input_is_unresolved_without_promoting_preview(self):
         core = self.core
         core.asr_request_context = {"utterance_id": 3}
         preview = "Önce kendimiz yaşayıp hem de ekranlarınızın başında sizler çocuklarınız aileleriniz"
@@ -92,8 +92,9 @@ class SelectionInferenceTests(unittest.TestCase):
         with patch.object(core, "_transcribe_pcm_i16_impl", side_effect=decode):
             core.transcribe_pcm_i16(np.full(96000, 4000, dtype=np.int16), partial=True)
             answer = core.transcribe_pcm_i16(np.full(298880, 4000, dtype=np.int16), partial=False)
-        self.assertEqual(answer, final)
+        self.assertEqual(answer, "")
         self.assertIn("final_preview_disagreement", core.last_asr_diagnostics["issues"])
+        self.assertIn("final_recovery_unresolved", core.last_asr_diagnostics["issues"])
         self.assertEqual(core.last_asr_diagnostics["preview_evidence"], preview)
 
     def test_decoder_loop_preview_is_review_only_while_authoritative_final_and_emphasis_survive(self):

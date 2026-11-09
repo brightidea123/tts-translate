@@ -31,6 +31,19 @@ def write_json(path, value):
 
 
 class SessionAuditTests(unittest.TestCase):
+    def rotated_fixture(self, directory, *, boundary_samples=4):
+        pcm = np.arange(8, dtype="<i2").tobytes()
+        for name, payload, offset in (("stream-a", pcm[:8], 0), ("stream-b", pcm[8:], boundary_samples)):
+            path = directory / (name + ".wav")
+            write_wav(path, payload)
+            write_json(directory / (name + ".json"), {
+                "kind": "stream_segment", "audio_file": path.name,
+                "timestamp_ns": 1_000_000_000 + offset * 62_500,
+                "sample_count": 4, "pcm_sha256": digest(payload), "file_sha256": digest(path.read_bytes()),
+            })
+        self.add_request(directory, pcm, 1, 3)
+        return pcm
+
     def fixture(self, directory):
         pcm = np.array([0, 32767, -32768, 1234, 5000, -6000, 111, 222], dtype="<i2").tobytes()
         write_wav(directory / "capture-stream.wav", pcm)
@@ -83,6 +96,63 @@ class SessionAuditTests(unittest.TestCase):
             for field in ("raw_payload_hash_mismatches", "request_hash_mismatches", "raw_to_stream_mismatches",
                           "model_input_hash_mismatches", "raw_to_float_mismatches"):
                 self.assertEqual(result["checks"][field], 1, field)
+
+    def test_request_crossing_contiguous_recording_rotation_is_compared_exactly(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            self.rotated_fixture(directory)
+            before = {p.name: p.read_bytes() for p in directory.iterdir()}
+            result = audit_sessions.audit_session(directory)
+            self.assertEqual(result["checks"]["raw_to_stream_compared"], 1)
+            self.assertEqual(result["checks"]["raw_to_stream_cross_segment_compared"], 1)
+            self.assertEqual(result["checks"]["raw_unmapped_to_stream"], 0)
+            self.assertEqual(result["checks"]["raw_to_stream_mismatches"], 0)
+            self.assertEqual(result["errors"], [])
+            self.assertEqual({p.name: p.read_bytes() for p in directory.iterdir()}, before)
+
+    def test_recording_rotation_gap_or_overlap_is_never_silently_spliced(self):
+        for boundary in (3, 5):
+            with self.subTest(boundary=boundary), tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary)
+                self.rotated_fixture(directory, boundary_samples=boundary)
+                result = audit_sessions.audit_session(directory)
+                self.assertEqual(result["checks"].get("raw_to_stream_compared", 0), 0)
+                self.assertEqual(result["checks"]["raw_unmapped_to_stream"], 1)
+
+    def test_recording_rotation_requires_consistent_pcm_format(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            pcm = self.rotated_fixture(directory)
+            with wave.open(str(directory / "stream-b.wav"), "wb") as handle:
+                handle.setnchannels(1)
+                handle.setsampwidth(2)
+                handle.setframerate(48000)
+                handle.writeframes(pcm[8:])
+            result = audit_sessions.audit_session(directory)
+            self.assertEqual(len(result["errors"]), 1)
+            self.assertIn("16 kHz", result["errors"][0]["error"])
+            self.assertEqual(result["checks"]["raw_unmapped_to_stream"], 1)
+
+    def test_runtime_session_configuration_is_used_when_recording_metadata_is_absent(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            runtime = directory / "runtime"
+            runtime.mkdir()
+            write_json(runtime / "session.json", {"config": {
+                "source_language": "HE", "target_language": "AR", "whisper_model": "large-v3",
+                "profile": "live", "asr_preprocessing": "raw", "debug": False, "private": "NOT_COPIED",
+            }})
+            result = audit_sessions.audit_session(directory, runtime)
+            self.assertEqual(result["config"], {"source_language": "HE", "target_language": "AR",
+                "whisper_model": "large-v3", "profile": "live", "asr_preprocessing": "raw", "debug": False})
+            self.assertNotIn("NOT_COPIED", json.dumps(result))
+            # AudioEvidence creates this manifest without runtime configuration.
+            write_json(directory / "session.json", {"session_id": "session", "note": "Local diagnostic audio"})
+            manifest = audit_sessions.audit_session(directory, runtime)
+            self.assertEqual(manifest["config"], result["config"])
+            write_json(directory / "session.json", {"config": {"source_language": "TR", "target_language": "EN"}})
+            legacy = audit_sessions.audit_session(directory, runtime)
+            self.assertEqual(legacy["config"]["source_language"], "TR")
 
     def test_filter_changes_partial_only_and_distinct_repeated_finals_are_review_flags(self):
         with tempfile.TemporaryDirectory() as temporary:

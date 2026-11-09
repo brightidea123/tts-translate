@@ -17,6 +17,43 @@ speech, destructive clause cleanup, wall-clock-dependent endpointing and Whisper
 control leaks. Accepted source text now has an independent decision log. See
 [the evidence and remaining accuracy limits](docs/SESSION_REVIEW_2026-11-08.md).
 
+**Latest six-session review:** saved audio/model-input integrity checks passed,
+but confirmed-prefix translation could wait indefinitely during continuous
+speech and Stop could abandon the last phrase. Live translation now batches
+growing confirmed text without restarting its deadline, defers optional work
+behind committed requests, and retries rejected admission. Stop finalizes
+captured tail audio and allows up to `--shutdown-grace-seconds 6` for accepted
+final transcription/translation; incomplete drains are explicit in the session's
+`shutdown-drain.json`. See [measured timings, fixes and remaining model-quality
+limits](docs/SESSION_REVIEW_2026-11-08_LATEST.md).
+
+**Pause timing review:** five newer recordings exposed a silence estimate that
+counted the same growing gap repeatedly and a text-stability clock that counted
+ASR results instead of elapsed audio time. Both are corrected. Only fresh text
+can accelerate a boundary; ellipses retain an unfinished-clause pause, and the
+18-second soft limit now respects the ordinary pause and hold. See
+[measurements, regression coverage and remaining accuracy questions](docs/PAUSE_REVIEW_2026-11-08.md).
+
+**Hebrew → Arabic follow-up:** two long clips collapsed into generic thank-you
+finals despite substantial previews. Conflicting outro previews are now held,
+and collapsed finals receive one bounded acoustic recovery pass with timestamped
+word ownership. Unresolved phrases preserve provisional words as “Review needed”
+instead of committing a suspect replacement. Long-prefix translation refreshes
+are paced by growth, and optional MT defers to pending final recognition. See
+[session evidence, recovery and concurrency limits](docs/SESSION_REVIEW_2026-11-09_HE_AR.md).
+
+**Full-debug follow-up:** a source-script rejection can now trigger acoustic
+language verification before discarding a possible language switch. Verified
+phrases retain their source language through MT, UI and logs. Short generic
+sign-offs also receive an additional check; unresolved wording stays marked for
+review. See [the missing-translation and thank-you investigation](docs/SESSION_REVIEW_2026-11-09_DEBUG.md).
+
+**Repeated-final follow-up:** strong decoder repetition now receives bounded
+audio recovery before translation. Unverified loops remain review cases, while
+ordinary repeated speech is preserved. Named input preferences can be saved in
+`settings.local.json`; capture diagnostics retain the actual resolved device.
+See [the repetition and input-route review](docs/SESSION_REVIEW_2026-11-09_REPETITION.md).
+
 **Live web update:** selecting original/translated phrases opens a translation
 tooltip; each pane has a persistent Auto-scroll control; unfinished cards use a
 darker background. Selection requests share a bounded background model queue,

@@ -171,6 +171,32 @@ class WebControllerTests(unittest.TestCase):
         finally:
             controller.close()
 
+    def test_explicit_system_default_overrides_a_remembered_named_input_in_child(self):
+        controller = WebController(core_path=Path(self.temporary.name) / "core.py",
+                                   initial_config={"input_device": "LitLink Audio Bridge"},
+                                   diagnostics_dir=Path(self.temporary.name) / "default-logs")
+        try:
+            self.assertTrue(controller.start({"input_device": None})["accepted"])
+            command = self.launches[0][0]
+            self.assertIn("--input-device=default", command)
+            self.assertNotIn("--input-device=LitLink Audio Bridge", command)
+            self.assertIsNone(controller.state()["config"]["input_device"])
+        finally:
+            controller.close()
+
+    def test_start_without_an_input_override_keeps_the_remembered_named_input(self):
+        controller = WebController(core_path=Path(self.temporary.name) / "core.py",
+                                   initial_config={"input_device": "LitLink Audio Bridge"},
+                                   diagnostics_dir=Path(self.temporary.name) / "named-logs")
+        try:
+            self.assertTrue(controller.start({"debug": True})["accepted"])
+            command = self.launches[0][0]
+            self.assertIn("--input-device=LitLink Audio Bridge", command)
+            self.assertNotIn("--input-device=default", command)
+            self.assertEqual(controller.state()["config"]["input_device"], "LitLink Audio Bridge")
+        finally:
+            controller.close()
+
     def test_unicode_reply_ack_retains_rejected_draft_and_clears_only_accepted(self):
         self.next_options = {"respond": lambda packet: {"accepted": packet.get("text") != "שלום مرحباً", "message": "full"}}
         self.controller.start()

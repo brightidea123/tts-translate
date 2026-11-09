@@ -103,6 +103,12 @@ def summarize_whisper_result(result: dict[str, Any]) -> dict[str, Any]:
                 "no_speech_prob", "compression_ratio",
             )},
         })
+        if "words" in segment:
+            segments[-1]["words"] = [
+                {"word": str(word.get("word", "")), "start": _finite(word.get("start")),
+                 "end": _finite(word.get("end"))}
+                for word in (segment.get("words") or []) if isinstance(word, dict)
+            ]
     logprobs = [s["avg_logprob"] for s in segments if s["avg_logprob"] is not None]
     speech = [s["no_speech_prob"] for s in segments if s["no_speech_prob"] is not None]
     compression = [s["compression_ratio"] for s in segments if s["compression_ratio"] is not None]

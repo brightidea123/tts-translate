@@ -20,6 +20,7 @@ from .headless_output import JsonOutputWriter
 
 
 _ACTIONS = frozenset({"reply", "flush", "mark", "stop", "lookup"})
+_LANGUAGE_CODES = frozenset({"AR", "HE", "DE", "TR", "FR", "RU", "EN", "ES"})
 _ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
 _LABEL = re.compile(
     r"^(?:[ \t]*(?:(?:🗣\ufe0f?|🌍|⌨\ufe0f?)[ \t]*)?)"
@@ -208,15 +209,21 @@ def _panel_messages(ui_state: Mapping[str, Any], side: str, source_language: str
     first = max(0, len(done) - 100)
 
     def add(entry: Mapping[str, Any], identity: str, *, finalized: bool) -> None:
+        entry_source = entry.get("source_language")
+        if not isinstance(entry_source, str) or entry_source not in _LANGUAGE_CODES:
+            entry_source = source_language
         message = {
             "id": identity,
             "source": _plain(entry.get("src", entry.get("source", "")), label=True),
             "translation": _plain(entry.get("dst", entry.get("translation", "")), label=True),
             "source_final": bool(entry.get("src_final", entry.get("source_final", finalized))),
             "translation_final": bool(entry.get("dst_final", entry.get("translation_final", finalized))),
-            "source_language": source_language,
+            "source_language": entry_source,
             "target_language": target_language,
         }
+        if entry.get("review_required"):
+            message.update(review_required=True,
+                           review_reason=_plain(entry.get("review_reason", "Final recognition needs review")))
         if side == "left":
             for key in ("audio_started_at", "audio_duration_seconds"):
                 if key in entry:

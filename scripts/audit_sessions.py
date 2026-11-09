@@ -19,6 +19,7 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 _CONTROLS = re.compile(r"<\|[^>]+\|>|<end_of_turn>|</?think\b[^>]*>")
+_CONFIG_KEYS = ("source_language", "target_language", "whisper_model", "asr_preprocessing", "debug", "profile")
 
 
 def _hash(payload: bytes) -> str:
@@ -68,6 +69,49 @@ def _has_saved_audio(directory: Path) -> bool:
     return False
 
 
+def _stream_slice(streams: list[tuple[dict, Path]], start_ns: int, samples: int) -> tuple[bytes, int] | None:
+    """Read one exact sample range, including adjacent recording rotations.
+
+    Each stream was already format/sample-count checked. Express boundaries
+    relative to the requested source timestamp, not file order or wall time.
+    Reject ambiguous overlap and missing samples instead of splicing past them.
+    """
+    if not isinstance(start_ns, int) or isinstance(start_ns, bool) or samples <= 0:
+        return None
+    ranges = []
+    for metadata, path in streams:
+        segment_start = metadata["timestamp_ns"]
+        segment_end = segment_start + metadata["sample_count"] * 62_500
+        if segment_start >= start_ns + samples * 62_500 or segment_end <= start_ns:
+            continue
+        delta = (metadata["timestamp_ns"] - start_ns) * 16000
+        offset = round(delta / 1_000_000_000)
+        if abs(delta - offset * 1_000_000_000) > 1_000_000:  # 0.001 sample tolerance
+            return None
+        end = offset + metadata["sample_count"]
+        if offset < samples and end > 0:
+            ranges.append((offset, end, path))
+    ranges.sort(key=lambda item: item[0])
+    if not ranges or ranges[0][0] > 0:
+        return None
+    if any(right[0] != left[1] for left, right in zip(ranges, ranges[1:])):
+        return None
+    chunks, cursor = [], 0
+    for start, end, path in ranges:
+        stop = min(end, samples)
+        count = stop - cursor
+        if count <= 0:
+            return None
+        chunk = _pcm(path, cursor - start, count)
+        if len(chunk) != count * 2:
+            return None
+        chunks.append(chunk)
+        cursor = stop
+        if cursor == samples:
+            return b"".join(chunks), len(chunks)
+    return None
+
+
 def audit_session(directory: Path, runtime_directory: Path | None = None) -> dict:
     """Inspect one recording directory; never mutate it or import the live core."""
     directory = directory.resolve()
@@ -84,8 +128,7 @@ def audit_session(directory: Path, runtime_directory: Path | None = None) -> dic
                 raise ValueError("Sidecar must be an object")
             kind = item.get("kind")
             if path.name == "session.json":
-                config = {key: item.get("config", {}).get(key) for key in (
-                    "source_language", "target_language", "whisper_model", "asr_preprocessing", "debug", "profile")}
+                config = {key: item.get("config", {}).get(key) for key in _CONFIG_KEYS}
             elif kind == "stream_segment":
                 artifact = _artifact(directory, item["audio_file"])
                 pcm = _pcm(artifact)
@@ -93,7 +136,12 @@ def audit_session(directory: Path, runtime_directory: Path | None = None) -> dic
                 checks["stream_pcm_hash_mismatches"] += _hash(pcm) != item.get("pcm_sha256")
                 checks["stream_file_hash_mismatches"] += _file_hash(artifact) != item.get("file_sha256")
                 checks["stream_sample_count_mismatches"] += len(pcm) // 2 != item.get("sample_count")
-                streams.append((item, artifact))
+                if not isinstance(item.get("timestamp_ns"), int) or isinstance(item.get("timestamp_ns"), bool):
+                    raise ValueError("Stream source timestamp must be integer nanoseconds")
+                if not isinstance(item.get("sample_count"), int) or isinstance(item.get("sample_count"), bool):
+                    raise ValueError("Stream sample count must be an integer")
+                if len(pcm) // 2 == item["sample_count"] and item["sample_count"] > 0:
+                    streams.append((item, artifact))
             elif kind == "issue_blob" and str(item.get("artifact_file", "")).endswith(".f32le"):
                 inputs.append(item)
             elif kind == "issue_clip" and isinstance(item.get("metadata", {}).get("request"), dict):
@@ -130,26 +178,31 @@ def audit_session(directory: Path, runtime_directory: Path | None = None) -> dic
             elif path.name.startswith("capture-") and path.name.endswith("-summary.json"):
                 summaries.append({key: item.get(key) for key in (
                     "capture_samples", "written_capture_samples", "rejected_capture_samples", "rejected_artifacts", "error", "closed")})
-        except (OSError, ValueError, KeyError, TypeError, wave.Error) as exc:
+        except (OSError, ValueError, KeyError, TypeError, AttributeError, wave.Error) as exc:
             failure(path, exc)
+
+    # Current sessions keep configuration beside their runtime journals. Older
+    # recording-owned session metadata remains supported without modification.
+    if not any(value is not None for value in config.values()) and runtime_directory is not None:
+        session_path = runtime_directory / "session.json"
+        if session_path.is_file() and session_path.resolve() != (directory / "session.json").resolve():
+            try:
+                item = json.loads(session_path.read_text(encoding="utf-8"))
+                config = {key: item.get("config", {}).get(key) for key in _CONFIG_KEYS}
+            except (OSError, ValueError, AttributeError, TypeError) as exc:
+                failure(session_path, exc)
 
     by_request = {row["request_id"]: row for row in requests}
     for row in requests:
         try:
             raw = _pcm(directory / row["artifact"])
-            matched = False
-            for metadata, path in streams:
-                delta = (row["start_ns"] - metadata["timestamp_ns"]) * 16000
-                offset = round(delta / 1_000_000_000)
-                if offset < 0 or offset + len(raw) // 2 > metadata["sample_count"]:
-                    continue
-                if abs(delta - offset * 1_000_000_000) > 1_000_000:  # 0.001 sample rounding tolerance
-                    continue
+            source = _stream_slice(streams, row["start_ns"], len(raw) // 2)
+            if source is not None:
+                payload, segments = source
                 checks["raw_to_stream_compared"] += 1
-                checks["raw_to_stream_mismatches"] += raw != _pcm(path, offset, len(raw) // 2)
-                matched = True
-                break
-            checks["raw_unmapped_to_stream"] += not matched
+                checks["raw_to_stream_mismatches"] += raw != payload
+                checks["raw_to_stream_cross_segment_compared"] += segments > 1
+            checks["raw_unmapped_to_stream"] += source is None
         except (OSError, ValueError, KeyError, TypeError, wave.Error) as exc:
             failure(Path(row["artifact"]), exc)
     for item in inputs:

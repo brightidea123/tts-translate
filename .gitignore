@@ -12,3 +12,4 @@ __pycache__/
 /tts.log
 /output.wav
 /effective-config.json
+/settings.local.json

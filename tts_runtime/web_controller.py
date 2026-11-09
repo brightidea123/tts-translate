@@ -170,8 +170,11 @@ class WebController:
                        *self.core_arguments,
                        "--source-language", config["source_language"], "--target-language", config["target_language"],
                        "--audio-review", config["audio_review"]]
-            if config["input_device"] is not None:
-                command.append("--input-device=" + str(config["input_device"]))
+            # Null is an explicit user choice here. Pass it through so a saved
+            # local preference cannot silently replace System default in the
+            # child process.
+            device_argument = "default" if config["input_device"] is None else str(config["input_device"])
+            command.append("--input-device=" + device_argument)
             if config["debug"]:
                 command.append("--debug")
             environment = os.environ.copy()

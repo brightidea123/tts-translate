@@ -183,17 +183,24 @@ class TranscriptPreservationTests(unittest.TestCase):
         self.assertEqual(errors, [])
 
 
-    def run_preview_results(self, results_to_deliver):
+    def run_preview_results(self, results_to_deliver, timing_observations=None, *, decisions=None,
+                            translations=None, status_updates=None, initial_entries=None):
         core = self.core
         stop = threading.Event()
         snapshots, errors = [], []
         state = deepcopy(core.ui_state)
         state.update(left_active={}, left_order=[], left_done=[])
+        if initial_entries:
+            state["left_active"] = deepcopy(initial_entries)
+            state["left_order"] = list(initial_entries)
 
         class FiniteQueue(Queue):
             def task_done(self):
                 super().task_done()
                 snapshots.append(deepcopy(state))
+                if timing_observations is not None:
+                    uid = core.current_partial_utterance_id
+                    timing_observations.append(core.partial_endpoint_observation(uid))
                 if self.unfinished_tasks == 0:
                     stop.set()
 
@@ -205,12 +212,88 @@ class TranscriptPreservationTests(unittest.TestCase):
             "render_dashboard": lambda: None, "ui_update": lambda **kw: errors.append(kw),
             "ring_endpoint": None, "latency_traces": {}, "inflight_partial_markers": {},
             "current_partial_utterance_id": None, "audio_final_transcripts": {},
-            "record_asr_decision": lambda *a: None, "enqueue_translation_task": lambda _task: True,
+            "record_asr_decision": lambda *args: decisions.append(args) if decisions is not None else None,
+            "enqueue_translation_task": lambda task: (translations.append(task) if translations is not None else None) or True,
             "forced_bos_for_target": lambda _target: None,
         }), patch.object(core.args, "stream_audio_translation", False):
             core.coordinator_worker()
-        self.assertEqual(errors, [])
+        if status_updates is None:
+            self.assertEqual(errors, [])
+        else:
+            status_updates.extend(errors)
         return snapshots
+
+    def test_unresolved_final_cannot_commit_fallback_or_erase_visible_words_and_late_work_stays_closed(self):
+        core = self.core
+        preview = "אנחנו צריכים להזמין חמש כיסאות כחולים ושישה כיסאות אדומים לפגישה מחר"
+        first = self.result(7, preview, duration=6)
+        first.partial = True
+        unresolved = self.result(7, "", duration=24.64)
+        unresolved.diagnostics.update(final_recovery={"status": "unresolved"},
+                                      preview_evidence="a different worker preview must not replace visible words")
+        late = self.result(7, "תודה רבה.", duration=25)
+        late.partial = True
+        decisions, translations, updates = [], [], []
+        with patch.object(core.args, "empty_final_action", "fallback"):
+            snapshots = self.run_preview_results([first, unresolved, late], decisions=decisions,
+                                                 translations=translations, status_updates=updates)
+        self.assertEqual(translations, [])
+        self.assertEqual([row[2] for row in decisions], ["unresolved_final"])
+        self.assertEqual(snapshots[1]["left_active"], {})
+        self.assertEqual(snapshots[1]["left_order"], [])
+        archived = snapshots[1]["left_done"][0]
+        self.assertEqual(archived["entry_id"], 7)
+        self.assertEqual(archived["source_preview"]["text"], preview)
+        self.assertFalse(archived["source_preview"]["inflight"])
+        self.assertTrue(archived["review_required"])
+        self.assertFalse(archived["src_final"])
+        self.assertFalse(archived["dst_final"])
+        self.assertEqual(snapshots[2]["left_done"], snapshots[1]["left_done"])
+        self.assertEqual(snapshots[2]["left_active"], {})
+        self.assertEqual(len(updates), 1)
+        self.assertIn("recognition needs review", updates[0]["status"])
+        state = snapshots[-1]
+        before = deepcopy(state)
+        with patch.dict(core.__dict__, {"ui_state": state, "render_dashboard": lambda: None}), \
+                patch.object(core.args, "speak_audio_translation", False):
+            for partial, stream_delta in [(True, False), (True, True), (False, False)]:
+                core.handle_translation_result(core.TranslationResult(source="audio", text="late translation",
+                    target_lang="AR", utterance_id=7, partial=partial, stream_delta=stream_delta,
+                    revision=archived["src_revision"]))
+                self.assertEqual(state, before)
+
+    def test_unresolved_final_without_a_displayed_preview_retains_worker_evidence_as_unverified(self):
+        core = self.core
+        preview = "שלום חברים אנחנו צריכים לקבוע פגישה חדשה למחר בשעה תשע בבוקר"
+        unresolved = self.result(2, "", duration=20.08)
+        unresolved.diagnostics.update(final_recovery={"status": "unresolved"}, preview_evidence=preview)
+        decisions, translations, updates = [], [], []
+        with patch.object(core.args, "empty_final_action", "fallback"):
+            snapshots = self.run_preview_results([unresolved], decisions=decisions,
+                                                 translations=translations, status_updates=updates)
+        archived = snapshots[0]["left_done"][0]
+        self.assertIn(preview, core.strip_ansi(archived["src"]))
+        self.assertEqual(archived["source_preview"], {"text": preview, "stable": "", "inflight": False})
+        self.assertTrue(archived["review_required"])
+        self.assertFalse(archived["src_final"])
+        self.assertFalse(archived["dst_final"])
+        self.assertEqual(snapshots[0]["left_active"], {})
+        self.assertEqual(translations, [])
+        self.assertEqual([row[2] for row in decisions], ["unresolved_final"])
+
+    def test_unresolved_final_replaces_only_a_blank_placeholder_with_unverified_worker_evidence(self):
+        core = self.core
+        preview = "אנחנו צריכים לקבוע פגישה חדשה למחר בשעה תשע בבוקר ליד התחנה"
+        entry = {**core.make_panel_entry(), "src": "HE~: ..",
+            "source_preview": {"text": "", "stable": "", "inflight": True}}
+        unresolved = self.result(2, "", duration=20.08)
+        unresolved.diagnostics.update(final_recovery={"status": "unresolved"}, preview_evidence=preview)
+        archived = self.run_preview_results([unresolved], status_updates=[], initial_entries={2: entry})[0]["left_done"][0]
+        self.assertEqual(archived["source_preview"]["text"], preview)
+        self.assertIn(preview, core.strip_ansi(archived["src"]))
+        self.assertEqual(archived["audio_duration_seconds"], 20.08)
+        self.assertTrue(archived["review_required"])
+        self.assertFalse(archived["src_final"])
 
     def test_first_word_is_visible_by_default_and_can_be_revised_then_finalized(self):
         core = self.core
@@ -232,6 +315,16 @@ class TranscriptPreservationTests(unittest.TestCase):
         self.assertTrue(final_entry["src_final"])
         self.assertNotIn("source_preview", final_entry)
         self.assertEqual(snapshots[3]["left_active"][1], final_entry)
+
+    def test_coordinator_stability_age_uses_audio_seconds_instead_of_result_count(self):
+        results = [self.result(1, "שלום", duration=1), self.result(1, "שלום", duration=2),
+                   self.result(1, "שלום עולם", duration=3), self.result(1, "שלום", duration=2.5)]
+        for result in results:
+            result.partial = True
+        observations = []
+        self.run_preview_results(results, observations)
+        self.assertEqual([item[2] for item in observations], [0, 1000, 0, 0])
+        self.assertEqual([item[4] for item in observations], [1_000_000_000, 2_000_000_000, 3_000_000_000, 3_000_000_000])
 
     def test_empty_later_preview_keeps_the_last_visible_words(self):
         first = self.result(1, "שלום", duration=1)
